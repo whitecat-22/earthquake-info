@@ -1,0 +1,9 @@
+requests
+boto3
+pandas
+geopandas
+pyogrio
+matplotlib
+slack-sdk
+xmltodict
+python-dotenv
