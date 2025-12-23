@@ -7,3 +7,4 @@ matplotlib
 slack-sdk
 xmltodict
 python-dotenv
+pyarrow

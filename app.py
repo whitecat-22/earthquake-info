@@ -44,6 +44,7 @@ S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 S3_KEY = os.getenv("S3_KEY")
 JMA_FEED_URL = os.getenv("JMA_FEED_URL")
 GEOJSON_PATH = os.getenv("GEOJSON_PATH")
+PARQUET_PATH = GEOJSON_PATH.replace('.geojson', '.parquet') if GEOJSON_PATH else 'city.parquet'
 APP_MODE = os.getenv("APP_MODE", "production") # 'production' or 'test'
 
 # 震度別の色定義
@@ -237,9 +238,13 @@ class EarthquakeMonitor:
 
             # 地図画像生成
             if self.gdf_japan is None:
-                print(f"Loading GeoJSON from {GEOJSON_PATH}...")
-                self.gdf_japan = gpd.read_file(GEOJSON_PATH)
-                print("GeoJSON loaded successfully.")
+                if os.path.exists(PARQUET_PATH):
+                    print(f"Loading Parquet from {PARQUET_PATH}...")
+                    self.gdf_japan = gpd.read_parquet(PARQUET_PATH)
+                else:
+                    print(f"Loading GeoJSON from {GEOJSON_PATH}...")
+                    self.gdf_japan = gpd.read_file(GEOJSON_PATH)
+                print("Map data loaded successfully.")
 
             image_buf = self.generate_map(epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude, formatted_time)
 
@@ -255,7 +260,8 @@ class EarthquakeMonitor:
             traceback.print_exc()
 
     def generate_map(self, epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude, time_str):
-        gdf = self.gdf_japan.copy()
+        # メモリ節約のため、必要な列だけに絞り込むか、copy()をやめる
+        gdf = self.gdf_japan
 
         def get_intensity_value(row):
             # 1. コードでの完全一致 (最優先)
@@ -286,33 +292,66 @@ class EarthquakeMonitor:
         ax.set_facecolor('#0a0a0b')
         fig.patch.set_facecolor('#0a0a0b')
 
-        # 1. 日本地図（背景）の描画
-        gdf.plot(ax=ax, color=gdf['color'], edgecolor='#2c2c2e', linewidth=0.2)
-
-        # 2. 震度アイコンの描画 (GeoJSONのポリゴンベース)
+        # 地図表示範囲の計算
         active_points = []
         if lon and lat:
             active_points.append((lon, lat))
 
-        for _, row in gdf.iterrows():
+        # 震度データのプロットと座標収集
+        relevant_gdf = gdf
+        if active_points:
+            # 一旦全データを回すが、代表点は事前計算済みのものを使う
+            # 重い geometry.representative_point() を回避
+            for _, row in gdf.iterrows():
+                intensity = get_intensity_value(row)
+                if intensity:
+                    active_points.append((row['rep_x'], row['rep_y']))
+
+        for st in station_data:
+            active_points.append((st['lon'], st['lat']))
+
+        if active_points:
+            lons_all, lats_all = zip(*active_points)
+            min_lon, max_lon = min(lons_all), max(lons_all)
+            min_lat, max_lat = min(lats_all), max(lats_all)
+
+            # マージン込みの表示範囲
+            margin_x = max((max_lon - min_lon) * 0.15, 0.8)
+            margin_y = max((max_lat - min_lat) * 0.15, 0.8)
+
+            # 最低表示範囲
+            if (max_lon - min_lon) < 4.0:
+                mid_x = (max_lon + min_lon) / 2
+                min_lon, max_lon = mid_x - 2.0, mid_x + 2.0
+            if (max_lat - min_lat) < 4.0:
+                mid_y = (max_lat + min_lat) / 2
+                min_lat, max_lat = mid_y - 2.0, mid_y + 2.0
+
+            lim_w, lim_e = min_lon - margin_x, max_lon + margin_x
+            lim_s, lim_n = min_lat - margin_y, max_lat + margin_y
+
+            # 4. 描画データの空間フィルタリング
+            # 表示範囲＋少し広めの範囲外データは描画しない（劇的な高速化）
+            relevant_gdf = gdf.cx[lim_w:lim_e, lim_s:lim_n]
+        else:
+            lim_w, lim_e = 128, 146
+            lim_s, lim_n = 30, 46
+            relevant_gdf = gdf
+
+        # 1. 日本地図（背景）の描画
+        relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2)
+
+        # 2. 震度アイコンの描画 (事前計算済み代表点を使用)
+        for _, row in relevant_gdf.iterrows():
             intensity = get_intensity_value(row)
-
             if intensity:
-                # ポリゴンの代表点に描画
-                try:
-                    point = row.geometry.representative_point()
-                    active_points.append((point.x, point.y))
-                    color = INTENSITY_COLORS.get(intensity, "#ffffff")
-                    label = INTENSITY_LABELS.get(intensity, intensity)
-
-                    # 矩形アイコン
-                    ax.plot(point.x, point.y, marker='s', markersize=10, color=color,
-                            markeredgecolor='black', markeredgewidth=0.5, zorder=8)
-                    # 震度文字
-                    ax.text(point.x, point.y, label, color='black' if intensity in ["1","2","3","4"] else 'white',
-                            fontsize=6, ha='center', va='center', fontweight='bold', zorder=9)
-                except:
-                    continue
+                color = INTENSITY_COLORS.get(intensity, "#ffffff")
+                label = INTENSITY_LABELS.get(intensity, intensity)
+                rx, ry = row['rep_x'], row['rep_y']
+                ax.plot(rx, ry, marker='s', markersize=10, color=color,
+                        markeredgecolor='black', markeredgewidth=0.5, zorder=8)
+                ax.text(rx, ry, label, color='black' if intensity in ["1","2","3","4"] else 'white',
+                        fontsize=6, ha='center', va='center', fontweight='bold', zorder=9)
 
         # 3. 観測点座標データがある場合（もしあれば重ねて描画）
         for st in station_data:
@@ -328,29 +367,9 @@ class EarthquakeMonitor:
         if lat and lon:
             ax.scatter(lon, lat, marker='x', color='#ff3b30', s=450, linewidths=4, zorder=20)
 
-        # 地図表示のズーム設定 (震源と震度観測点をすべて収める)
-        if active_points:
-            lons, lats = zip(*active_points)
-            min_lon, max_lon = min(lons), max(lons)
-            min_lat, max_lat = min(lats), max(lats)
-
-            # マージン（範囲の15%程度、かつ最低0.8度）
-            margin_x = max((max_lon - min_lon) * 0.15, 0.8)
-            margin_y = max((max_lat - min_lat) * 0.15, 0.8)
-
-            # 最低表示範囲（狭すぎると地図として見づらいため）
-            if (max_lon - min_lon) < 4.0:
-                mid_x = (max_lon + min_lon) / 2
-                min_lon, max_lon = mid_x - 2.0, mid_x + 2.0
-            if (max_lat - min_lat) < 4.0:
-                mid_y = (max_lat + min_lat) / 2
-                min_lat, max_lat = mid_y - 2.0, mid_y + 2.0
-
-            ax.set_xlim(min_lon - margin_x, max_lon + margin_x)
-            ax.set_ylim(min_lat - margin_y, max_lat + margin_y)
-        else:
-            ax.set_xlim(128, 146)
-            ax.set_ylim(30, 46)
+        # 地図表示のズーム設定
+        ax.set_xlim(lim_w, lim_e)
+        ax.set_ylim(lim_s, lim_n)
 
         # 情報表示
         info_text = f"発生: {time_str}\n震央地名: {epicenter_name}\n深さ: {depth}\n規模: M{magnitude}"
@@ -427,7 +446,9 @@ def lambda_handler(event, context):
     # 処理対象のタイトル
     TARGET_TITLES = ["震源・震度に関する情報", "震度速報", "遠地地震に関する情報"]
 
-    for entry in reversed(entries[:10]): # 念のため10件まで確認
+    processed_ids = []
+
+    for entry in reversed(entries[:10]): # 古い順に処理
         title = entry.get('title', '')
         event_id = entry.get('id')
 
@@ -435,13 +456,18 @@ def lambda_handler(event, context):
             print(f"Skipping: {title} (Not a target title)")
             continue
 
-        if monitor.last_event_id == event_id:
+        if monitor.last_event_id == event_id or event_id in processed_ids:
             print(f"Skipping: {title} (Already processed: {event_id})")
             continue
 
         detail_url = entry.get('link', {}).get('@href')
         print(f"!!! Triggering notification for: {title} ({event_id}) !!!")
+
+        # 処理前に last_event_id を更新して多重起動時の重複を抑制
+        # handle_detail内でも保存されるが、ループ内での重複処理も防ぐ
         monitor.handle_detail(detail_url, event_id)
+        processed_ids.append(event_id)
+        monitor.last_event_id = event_id
 
     return {"statusCode": 200, "body": "Success"}
 

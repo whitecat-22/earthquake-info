@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 3. アプリケーションコードとデータをコピー
 COPY app.py ./
-COPY city.geojson ./
+COPY city.parquet ./
 
 # 4. Lambdaハンドラを指定
 CMD ["app.lambda_handler"]
