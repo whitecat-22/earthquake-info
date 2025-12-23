@@ -174,18 +174,24 @@ class EarthquakeMonitor:
                     for area in areas:
                         # 震度細分区域名での震度
                         area_name = area.get('Name')
+                        area_code = area.get('Code')
                         area_max = area.get('MaxInt')
                         if area_max:
-                            regional_intensities[area_name] = area_max
+                            if isinstance(area_max, dict): area_max = area_max.get('#text')
+                            if area_name: regional_intensities[area_name] = area_max
+                            if area_code: regional_intensities[str(area_code)] = area_max
 
                         # 市町村ごとの処理
                         cities = area.get('City', [])
                         if isinstance(cities, dict): cities = [cities]
                         for city in cities:
                             city_name = city.get('Name')
+                            city_code = city.get('Code')
                             city_max = city.get('MaxInt')
                             if city_max:
-                                regional_intensities[city_name] = city_max
+                                if isinstance(city_max, dict): city_max = city_max.get('#text')
+                                if city_name: regional_intensities[city_name] = city_max
+                                if city_code: regional_intensities[str(city_code)] = city_max
 
                             # 観測点ごとの処理 (座標がある場合のみ取得)
                             stations = city.get('IntensityStation', [])
@@ -251,16 +257,26 @@ class EarthquakeMonitor:
     def generate_map(self, epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude, time_str):
         gdf = self.gdf_japan.copy()
 
+        def get_intensity_value(row):
+            # 1. コードでの完全一致 (最優先)
+            # city.geojsonの'code'や、一般的な'N03_007'、'CODE'をチェック
+            code = row.get('code') or row.get('CODE') or row.get('N03_007')
+            if code and str(code) in regional_intensities:
+                return regional_intensities[str(code)]
+
+            # 2. 名称での完全一致
+            names = [
+                row.get('name'), row.get('nam'), row.get('name_ja'),
+                row.get('COMMNAME'), row.get('CITYNAME'), row.get('N03_004')
+            ]
+            for n in names:
+                if n and n in regional_intensities:
+                    return regional_intensities[n]
+
+            return None
+
         def get_color(row):
-            # プロパティ名を多角的にチェック
-            name = row.get('name') or row.get('nam') or row.get('name_ja') or \
-                   row.get('N03_004') or row.get('COMMNAME') or row.get('CITYNAME')
-            intensity = regional_intensities.get(name)
-            if not intensity:
-                for k, v in regional_intensities.items():
-                    if k and name and (k in str(name) or str(name) in k):
-                        intensity = v
-                        break
+            intensity = get_intensity_value(row)
             # 震度がない地域は背景色
             return INTENSITY_COLORS.get(intensity, "#1a1a1c")
 
@@ -274,22 +290,18 @@ class EarthquakeMonitor:
         gdf.plot(ax=ax, color=gdf['color'], edgecolor='#2c2c2e', linewidth=0.2)
 
         # 2. 震度アイコンの描画 (GeoJSONのポリゴンベース)
-        for _, row in gdf.iterrows():
-            name = row.get('name') or row.get('nam') or row.get('name_ja') or \
-                   row.get('N03_004') or row.get('COMMNAME') or row.get('CITYNAME')
-            intensity = regional_intensities.get(name)
+        active_points = []
+        if lon and lat:
+            active_points.append((lon, lat))
 
-            # 部分一致での補完
-            if not intensity:
-                for k, v in regional_intensities.items():
-                    if k and name and (k in str(name) or str(name) in k):
-                        intensity = v
-                        break
+        for _, row in gdf.iterrows():
+            intensity = get_intensity_value(row)
 
             if intensity:
                 # ポリゴンの代表点に描画
                 try:
                     point = row.geometry.representative_point()
+                    active_points.append((point.x, point.y))
                     color = INTENSITY_COLORS.get(intensity, "#ffffff")
                     label = INTENSITY_LABELS.get(intensity, intensity)
 
@@ -304,6 +316,7 @@ class EarthquakeMonitor:
 
         # 3. 観測点座標データがある場合（もしあれば重ねて描画）
         for st in station_data:
+            active_points.append((st['lon'], st['lat']))
             color = INTENSITY_COLORS.get(st['intensity'], "#ffffff")
             label = INTENSITY_LABELS.get(st['intensity'], st['intensity'])
             ax.plot(st['lon'], st['lat'], marker='s', markersize=10, color=color,
@@ -315,10 +328,26 @@ class EarthquakeMonitor:
         if lat and lon:
             ax.scatter(lon, lat, marker='x', color='#ff3b30', s=450, linewidths=4, zorder=20)
 
-        # 地図表示のズーム設定 (震源中心)
-        if lat and lon:
-            ax.set_xlim(lon - 3.5, lon + 3.5)
-            ax.set_ylim(lat - 3.0, lat + 3.0)
+        # 地図表示のズーム設定 (震源と震度観測点をすべて収める)
+        if active_points:
+            lons, lats = zip(*active_points)
+            min_lon, max_lon = min(lons), max(lons)
+            min_lat, max_lat = min(lats), max(lats)
+
+            # マージン（範囲の15%程度、かつ最低0.8度）
+            margin_x = max((max_lon - min_lon) * 0.15, 0.8)
+            margin_y = max((max_lat - min_lat) * 0.15, 0.8)
+
+            # 最低表示範囲（狭すぎると地図として見づらいため）
+            if (max_lon - min_lon) < 4.0:
+                mid_x = (max_lon + min_lon) / 2
+                min_lon, max_lon = mid_x - 2.0, mid_x + 2.0
+            if (max_lat - min_lat) < 4.0:
+                mid_y = (max_lat + min_lat) / 2
+                min_lat, max_lat = mid_y - 2.0, mid_y + 2.0
+
+            ax.set_xlim(min_lon - margin_x, max_lon + margin_x)
+            ax.set_ylim(min_lat - margin_y, max_lat + margin_y)
         else:
             ax.set_xlim(128, 146)
             ax.set_ylim(30, 46)
@@ -461,9 +490,6 @@ if __name__ == "__main__":
             monitor.handle_detail(target_entry.get('link', {}).get('@href'), target_entry.get('id'))
             print("--- Local Test Finished ---")
     else:
-        # --- 本番運用モード ---
-        print("--- Production Monitoring Mode Start ---")
-        import time
-        while True:
-            lambda_handler({}, None)
-            time.sleep(60)
+        # --- 本番運用モード (実行はEventBridge等に委ねる) ---
+        print("--- Production Mode Start (One-shot) ---")
+        lambda_handler({}, None)
