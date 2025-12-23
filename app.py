@@ -68,44 +68,50 @@ INTENSITY_LABELS = {
 
 s3_client = boto3.client('s3')
 
-
 class EarthquakeMonitor:
     def __init__(self):
-        self.last_event_id = self._load_last_id()
+        state = self._load_state()
+        self.last_event_id = state.get('id')
+        # 過去のフォーマット('updated')も考慮する
+        self.last_event_time = state.get('event_time') or state.get('updated')
         self.slack_client = WebClient(token=SLACK_BOT_TOKEN)
+        print(f"Loaded state from S3: ID={self.last_event_id}, Time={self.last_event_time}")
         # Lambdaの起動が高速になるよう、GeoJSONの読み込みは必要時まで遅延させるか、初期化時に行う
         self.gdf_japan = None
 
 
-    def _load_last_id(self):
+    def _load_state(self):
         if not S3_BUCKET:
-            return None
+            return {}
         try:
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=S3_KEY)
             body = response['Body'].read().decode('utf-8')
-            if not body:  # 0バイトファイルの場合
+            if not body:
                 print(f"S3 state file {S3_KEY} is empty.")
-                return None
-            data = json.loads(body)
-            return data.get('id')
+                return {}
+            return json.loads(body)
         except s3_client.exceptions.NoSuchKey:
             print(f"S3 state file {S3_KEY} not found. Starting fresh.")
-            return None
+            return {}
         except Exception as e:
-            # ここで AccessDenied などの具体的なエラーを確認できるようにします
             print(f"Error loading state from S3 ({S3_BUCKET}): {e}")
-            return None
+            return {}
 
 
-    def _save_last_id(self, event_id):
+    def _save_state(self, event_id, event_time):
         if not S3_BUCKET:
             return
         try:
             s3_client.put_object(
                 Bucket=S3_BUCKET,
                 Key=S3_KEY,
-                Body=json.dumps({'id': event_id, 'updated': datetime.datetime.now().isoformat()})
+                Body=json.dumps({
+                    'id': event_id,
+                    'event_time': event_time,
+                    'updated_at': datetime.datetime.now().isoformat()
+                })
             )
+            print(f"State saved to S3: ID={event_id}, Time={event_time}")
         except Exception as e:
             print(f"Error saving state to S3: {e}")
 
@@ -226,7 +232,7 @@ class EarthquakeMonitor:
                         # 負の数は地中、正の数は空中（海抜）
                         depth = f"約{abs(int(depth_m / 1000))}km"
 
-            # 1. 発生時刻のフォーマット修正
+            # 発生時刻のフォーマット修正
             def format_time(ts):
                 try:
                     dt = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
@@ -251,26 +257,21 @@ class EarthquakeMonitor:
             # Slack通知
             self.send_to_slack(headline_text, epicenter_name, magnitude, depth, formatted_time, tsunami_text, image_buf)
 
-            # 状態更新
-            self._save_last_id(event_id)
-
         except Exception as e:
             print(f"Error processing detail: {e}")
             import traceback
             traceback.print_exc()
 
     def generate_map(self, epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude, time_str):
-        # メモリ節約のため、必要な列だけに絞り込むか、copy()をやめる
         gdf = self.gdf_japan
 
         def get_intensity_value(row):
-            # 1. コードでの完全一致 (最優先)
-            # city.geojsonの'code'や、一般的な'N03_007'、'CODE'をチェック
+            # コードでの完全一致 (最優先)
             code = row.get('code') or row.get('CODE') or row.get('N03_007')
             if code and str(code) in regional_intensities:
                 return regional_intensities[str(code)]
 
-            # 2. 名称での完全一致
+            # 名称での完全一致
             names = [
                 row.get('name'), row.get('nam'), row.get('name_ja'),
                 row.get('COMMNAME'), row.get('CITYNAME'), row.get('N03_004')
@@ -278,34 +279,23 @@ class EarthquakeMonitor:
             for n in names:
                 if n and n in regional_intensities:
                     return regional_intensities[n]
-
             return None
 
-        def get_color(row):
-            intensity = get_intensity_value(row)
-            # 震度がない地域は背景色
-            return INTENSITY_COLORS.get(intensity, "#1a1a1c")
-
-        gdf['color'] = gdf.apply(get_color, axis=1)
-
-        fig, ax = plt.subplots(figsize=(12, 12))
-        ax.set_facecolor('#0a0a0b')
-        fig.patch.set_facecolor('#0a0a0b')
-
-        # 地図表示範囲の計算
+        # 表示範囲の計算 (ベクトル演算でマッチング)
         active_points = []
         if lon and lat:
             active_points.append((lon, lat))
 
-        # 震度データのプロットと座標収集
-        relevant_gdf = gdf
-        if active_points:
-            # 一旦全データを回すが、代表点は事前計算済みのものを使う
-            # 重い geometry.representative_point() を回避
-            for _, row in gdf.iterrows():
-                intensity = get_intensity_value(row)
-                if intensity:
-                    active_points.append((row['rep_x'], row['rep_y']))
+        target_keys = set(str(k) for k in regional_intensities.keys())
+        mask = pd.Series(False, index=gdf.index)
+        match_cols = ['code', 'CODE', 'N03_007', 'name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004']
+        for col in match_cols:
+            if col in gdf.columns:
+                mask |= gdf[col].astype(str).isin(target_keys)
+
+        active_gdf = gdf[mask]
+        if not active_gdf.empty:
+            active_points.extend(list(zip(active_gdf['rep_x'], active_gdf['rep_y'])))
 
         for st in station_data:
             active_points.append((st['lon'], st['lat']))
@@ -315,11 +305,9 @@ class EarthquakeMonitor:
             min_lon, max_lon = min(lons_all), max(lons_all)
             min_lat, max_lat = min(lats_all), max(lats_all)
 
-            # マージン込みの表示範囲
             margin_x = max((max_lon - min_lon) * 0.15, 0.8)
             margin_y = max((max_lat - min_lat) * 0.15, 0.8)
 
-            # 最低表示範囲
             if (max_lon - min_lon) < 4.0:
                 mid_x = (max_lon + min_lon) / 2
                 min_lon, max_lon = mid_x - 2.0, mid_x + 2.0
@@ -330,18 +318,25 @@ class EarthquakeMonitor:
             lim_w, lim_e = min_lon - margin_x, max_lon + margin_x
             lim_s, lim_n = min_lat - margin_y, max_lat + margin_y
 
-            # 4. 描画データの空間フィルタリング
-            # 表示範囲＋少し広めの範囲外データは描画しない（劇的な高速化）
-            relevant_gdf = gdf.cx[lim_w:lim_e, lim_s:lim_n]
+            # 表示範囲＋αでフィルタリング
+            relevant_gdf = gdf.cx[lim_w:lim_e, lim_s:lim_n].copy()
         else:
             lim_w, lim_e = 128, 146
             lim_s, lim_n = 30, 46
-            relevant_gdf = gdf
+            relevant_gdf = gdf.copy()
 
-        # 1. 日本地図（背景）の描画
+        # 必要な範囲のみ着色処理 (applyの回数を最小化)
+        relevant_gdf['color'] = relevant_gdf.apply(
+            lambda row: INTENSITY_COLORS.get(get_intensity_value(row), "#1a1a1c"), axis=1
+        )
+
+        fig, ax = plt.subplots(figsize=(12, 12))
+        ax.set_facecolor('#0a0a0b')
+        fig.patch.set_facecolor('#0a0a0b')
+
+        # 描画
         relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2)
 
-        # 2. 震度アイコンの描画 (事前計算済み代表点を使用)
         for _, row in relevant_gdf.iterrows():
             intensity = get_intensity_value(row)
             if intensity:
@@ -353,7 +348,7 @@ class EarthquakeMonitor:
                 ax.text(rx, ry, label, color='black' if intensity in ["1","2","3","4"] else 'white',
                         fontsize=6, ha='center', va='center', fontweight='bold', zorder=9)
 
-        # 3. 観測点座標データがある場合（もしあれば重ねて描画）
+        # 観測点座標データがある場合（もしあれば重ねて描画）
         for st in station_data:
             active_points.append((st['lon'], st['lat']))
             color = INTENSITY_COLORS.get(st['intensity'], "#ffffff")
@@ -363,7 +358,7 @@ class EarthquakeMonitor:
             ax.text(st['lon'], st['lat'], label, color='black' if st['intensity'] in ["1","2","3","4"] else 'white',
                     fontsize=6, ha='center', va='center', fontweight='bold', zorder=11)
 
-        # 4. 震源地のプロット
+        # 震源地のプロット
         if lat and lon:
             ax.scatter(lon, lat, marker='x', color='#ff3b30', s=450, linewidths=4, zorder=20)
 
@@ -446,28 +441,46 @@ def lambda_handler(event, context):
     # 処理対象のタイトル
     TARGET_TITLES = ["震源・震度に関する情報", "震度速報", "遠地地震に関する情報"]
 
-    processed_ids = []
+    # 初回の状態を保持
+    orig_last_id = monitor.last_event_id
+    orig_last_time = monitor.last_event_time
 
-    for entry in reversed(entries[:10]): # 古い順に処理
+    current_last_id = orig_last_id
+    current_last_time = orig_last_time
+
+    # 古い順に最大15件確認
+    for entry in reversed(entries[:15]):
         title = entry.get('title', '')
-        event_id = entry.get('id')
+        event_id = entry.get('id', '').strip()
+        event_time = entry.get('updated', '').strip()
 
         if title not in TARGET_TITLES:
             print(f"Skipping: {title} (Not a target title)")
             continue
 
-        if monitor.last_event_id == event_id or event_id in processed_ids:
-            print(f"Skipping: {title} (Already processed: {event_id})")
+        # IDが一致するか、または保存されている最新時刻より古い場合はスキップ
+        is_already_processed = False
+        if event_id == (current_last_id or "").strip():
+            is_already_processed = True
+        elif current_last_time and event_time <= current_last_time:
+            is_already_processed = True
+
+        if is_already_processed:
+            print(f"Skipping: {title} (Matches state. ID: {event_id}, Time: {event_time})")
             continue
 
         detail_url = entry.get('link', {}).get('@href')
         print(f"!!! Triggering notification for: {title} ({event_id}) !!!")
 
-        # 処理前に last_event_id を更新して多重起動時の重複を抑制
-        # handle_detail内でも保存されるが、ループ内での重複処理も防ぐ
         monitor.handle_detail(detail_url, event_id)
-        processed_ids.append(event_id)
-        monitor.last_event_id = event_id
+
+        # 状態を最新に更新
+        current_last_id = event_id
+        current_last_time = event_time
+
+    # 実際に処理が行われ、状態が更新された場合のみS3に保存
+    if current_last_id != orig_last_id or current_last_time != orig_last_time:
+        monitor._save_state(current_last_id, current_last_time)
 
     return {"statusCode": 200, "body": "Success"}
 
