@@ -16,11 +16,15 @@ from dotenv import load_dotenv
 
 # Lambda環境でのMatplotlib書き込みエラー対策
 os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'
-
-# フォント設定を共通化
+import matplotlib
+matplotlib.use('Agg') # GUIなし環境向けのバックエンド
 import matplotlib.font_manager as fm
+import matplotlib.pyplot as plt
 
+_cached_font = None
 def setup_fonts():
+    global _cached_font
+    if _cached_font: return _cached_font
     # Lambda環境とローカル環境の両方で利用可能なフォントを探す
     target_fonts = ["Noto Sans CJK JP", "Noto Sans JP", "IPAGothic", "IPAexGothic", "VL Gothic", "MS Gothic"]
     available_fonts = [f.name for f in fm.fontManager.ttflist]
@@ -60,8 +64,14 @@ INTENSITY_COLORS = {
     "7": "#B40068",
 }
 
-# 震点の表示設定
+# 震点アイコン内などの短い表記 (5+, 5-, etc.)
 INTENSITY_LABELS = {
+    "1": "1", "2": "2", "3": "3", "4": "4",
+    "5-": "5-", "5+": "5+", "6-": "6-", "6+": "6+", "7": "7"
+}
+
+# パネルなどのテキスト用表記 (5弱, 5強, etc.)
+INTENSITY_DISPLAY_NAMES = {
     "1": "1", "2": "2", "3": "3", "4": "4",
     "5-": "5弱", "5+": "5強", "6-": "6弱", "6+": "6強", "7": "7"
 }
@@ -75,8 +85,8 @@ class EarthquakeMonitor:
         # 過去のフォーマット('updated')も考慮する
         self.last_event_time = state.get('event_time') or state.get('updated')
         self.slack_client = WebClient(token=SLACK_BOT_TOKEN)
+        self.session = requests.Session() # コネクションプーリングで高速化
         print(f"Loaded state from S3: ID={self.last_event_id}, Time={self.last_event_time}")
-        # Lambdaの起動が高速になるよう、GeoJSONの読み込みは必要時まで遅延させるか、初期化時に行う
         self.gdf_japan = None
 
 
@@ -121,11 +131,8 @@ class EarthquakeMonitor:
             print("Error: JMA_FEED_URL is not set.")
             return []
         try:
-            print(f"Fetching feed from: {JMA_FEED_URL}")
-            response = requests.get(JMA_FEED_URL, timeout=10)
+            response = self.session.get(JMA_FEED_URL, timeout=10)
             response.raise_for_status()
-            # response.text ではなく response.content (bytes) を渡すことで、
-            # xmltodictがXMLヘッダーに基づいて正しくエンコードを処理します
             feed = xmltodict.parse(response.content)
             entries = feed.get('feed', {}).get('entry', [])
             if isinstance(entries, dict):
@@ -136,10 +143,9 @@ class EarthquakeMonitor:
             print(f"Error fetching feed: {e}")
             return []
 
-
     def handle_detail(self, url, event_id):
         try:
-            response = requests.get(url)
+            response = self.session.get(url, timeout=10)
             xml_data = xmltodict.parse(response.content)
             body = xml_data['Report']['Body']
             head = xml_data['Report']['Head']
@@ -232,7 +238,7 @@ class EarthquakeMonitor:
                         # 負の数は地中、正の数は空中（海抜）
                         depth = f"約{abs(int(depth_m / 1000))}km"
 
-            # 発生時刻のフォーマット修正
+            # 発表時刻のフォーマット
             def format_time(ts):
                 try:
                     dt = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
@@ -240,7 +246,30 @@ class EarthquakeMonitor:
                 except:
                     return ts
 
+            # 地図描画用にはパースしやすい形式、Slack用には表示用形式を使用
+            map_time_str = origin_time[:19].replace('T', ' ')
             formatted_time = format_time(origin_time)
+
+            def format_atime(ts):
+                try:
+                    # TargetDateTime: 2025-12-26T01:22:00+09:00
+                    dt = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    return dt.strftime('%Y年%m月%d日 %H:%M 発表')
+                except:
+                    return ts
+            # 発生時刻のフォーマット修正
+            announcement_time = format_atime(head.get('TargetDateTime', ''))
+
+            # 最大震度の特定
+            max_intensity = "0"
+            if regional_intensities:
+                # 震度の順序定義
+                order = {"0":0, "1":1, "2":2, "3":3, "4":4, "5-":5, "5+":6, "6-":7, "6+":8, "7":9}
+                current_max_val = -1
+                for v in regional_intensities.values():
+                    if v in order and order[v] > current_max_val:
+                        current_max_val = order[v]
+                        max_intensity = v
 
             # 地図画像生成
             if self.gdf_japan is None:
@@ -252,7 +281,10 @@ class EarthquakeMonitor:
                     self.gdf_japan = gpd.read_file(GEOJSON_PATH)
                 print("Map data loaded successfully.")
 
-            image_buf = self.generate_map(epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude, formatted_time)
+            image_buf = self.generate_map(
+                epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude,
+                map_time_str, announcement_time, max_intensity, tsunami_text
+            )
 
             # Slack通知
             self.send_to_slack(headline_text, epicenter_name, magnitude, depth, formatted_time, tsunami_text, image_buf)
@@ -262,7 +294,7 @@ class EarthquakeMonitor:
             import traceback
             traceback.print_exc()
 
-    def generate_map(self, epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude, time_str):
+    def generate_map(self, epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude, time_str, announce_time, max_int, tsunami_text):
         gdf = self.gdf_japan
 
         def get_intensity_value(row):
@@ -281,7 +313,7 @@ class EarthquakeMonitor:
                     return regional_intensities[n]
             return None
 
-        # 表示範囲の計算 (ベクトル演算でマッチング)
+        # 1. 表示範囲の計算 (ベクトル演算でマッチング)
         active_points = []
         if lon and lat:
             active_points.append((lon, lat))
@@ -305,8 +337,8 @@ class EarthquakeMonitor:
             min_lon, max_lon = min(lons_all), max(lons_all)
             min_lat, max_lat = min(lats_all), max(lats_all)
 
-            margin_x = max((max_lon - min_lon) * 0.15, 0.8)
-            margin_y = max((max_lat - min_lat) * 0.15, 0.8)
+            margin_x = max((max_lon - min_lon) * 0.15, 1.2)
+            margin_y = max((max_lat - min_lat) * 0.15, 1.2)
 
             if (max_lon - min_lon) < 4.0:
                 mid_x = (max_lon + min_lon) / 2
@@ -318,89 +350,194 @@ class EarthquakeMonitor:
             lim_w, lim_e = min_lon - margin_x, max_lon + margin_x
             lim_s, lim_n = min_lat - margin_y, max_lat + margin_y
 
-            # 表示範囲＋αでフィルタリング
             relevant_gdf = gdf.cx[lim_w:lim_e, lim_s:lim_n].copy()
         else:
             lim_w, lim_e = 128, 146
             lim_s, lim_n = 30, 46
             relevant_gdf = gdf.copy()
 
-        # 必要な範囲のみ着色処理 (applyの回数を最小化)
-        relevant_gdf['color'] = relevant_gdf.apply(
-            lambda row: INTENSITY_COLORS.get(get_intensity_value(row), "#1a1a1c"), axis=1
-        )
+        # 震度判定用のマッピングテーブルを事前に作成 (高速化)
+        # ID優先で検索するための辞書
+        gdf_cols = [c for c in ['code', 'CODE', 'N03_007', 'name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004'] if c in gdf.columns]
 
-        fig, ax = plt.subplots(figsize=(12, 12))
-        ax.set_facecolor('#0a0a0b')
-        fig.patch.set_facecolor('#0a0a0b')
+        def precalculate_intensity(row):
+            for col in gdf_cols:
+                val = str(row[col])
+                if val in regional_intensities:
+                    return regional_intensities[val]
+            return None
 
-        # 描画 (市町村区域は透明度70%)
+        relevant_gdf['intensity'] = relevant_gdf.apply(precalculate_intensity, axis=1)
+        relevant_gdf['color'] = relevant_gdf['intensity'].map(lambda x: INTENSITY_COLORS.get(x, "#7c7c7c"))
+
+        # 描画対象 (震度がある地域) を抽出
+        active_regions = relevant_gdf[relevant_gdf['intensity'].notna()].copy()
+
+        # 16:9 (1920x1080)
+        fig, ax = plt.subplots(figsize=(19.2, 10.8))
+
+        # 背景色
+        bg_color = '#001f41'
+        ax.set_facecolor(bg_color)
+        fig.patch.set_facecolor(bg_color)
+
+        # 3. 描画
         relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2, alpha=0.6)
 
-        for _, row in relevant_gdf.iterrows():
-            intensity = get_intensity_value(row)
-            if intensity:
-                color = INTENSITY_COLORS.get(intensity, "#ffffff")
-                label = INTENSITY_LABELS.get(intensity, intensity)
-                rx, ry = row['rep_x'], row['rep_y']
-                ax.plot(rx, ry, marker='s', markersize=10, color=color,
-                        markeredgecolor='black', markeredgewidth=0.5, zorder=8)
-                ax.text(rx, ry, label, color='black' if intensity in ["1","2","3","4"] else 'white',
-                        fontsize=6, ha='center', va='center', fontweight='bold', zorder=9)
+        # 震度アイコン (一括処理に近い形でループを回す)
+        for _, row in active_regions.iterrows():
+            val = row['intensity']
+            color = INTENSITY_COLORS.get(val, "#ffffff")
+            label = INTENSITY_LABELS.get(val, val)
+            ax.plot(row['rep_x'], row['rep_y'], marker='s', markersize=12, color=color,
+                    markeredgecolor='#000000', markeredgewidth=0.5, zorder=8)
+            ax.text(row['rep_x'], row['rep_y'], label, color='#000000' if val in ["1","2","4","5-","5+"] else '#ffffff',
+                    fontsize=8, ha='center', va='center', fontweight='bold', zorder=9)
 
-        # 観測点座標データがある場合（もしあれば重ねて描画）
+        # 観測点座標
         for st in station_data:
-            active_points.append((st['lon'], st['lat']))
             color = INTENSITY_COLORS.get(st['intensity'], "#ffffff")
             label = INTENSITY_LABELS.get(st['intensity'], st['intensity'])
-            ax.plot(st['lon'], st['lat'], marker='s', markersize=10, color=color,
-                    markeredgecolor='black', markeredgewidth=0.5, zorder=10)
-            ax.text(st['lon'], st['lat'], label, color='black' if st['intensity'] in ["1","2","3","4"] else 'white',
-                    fontsize=6, ha='center', va='center', fontweight='bold', zorder=11)
+            ax.plot(st['lon'], st['lat'], marker='o', markersize=10, color=color,
+                    markeredgecolor='#ffffff', markeredgewidth=0.8, zorder=10)
+            ax.text(st['lon'], st['lat'], label, color='#000000' if st['intensity'] in ["1","2","4","5-","5+"] else '#ffffff',
+                    fontsize=7, ha='center', va='center', fontweight='bold', zorder=11)
 
-        # 震源地のプロット
+        # 震源地
         if lat and lon:
-            ax.scatter(lon, lat, marker='x', color='#ff3b30', s=450, linewidths=4, zorder=20)
+            ax.scatter(lon, lat, marker='x', color='#ffffff', s=80, linewidths=2.5, zorder=20)
+            ax.scatter(lon, lat, marker='x', color='#ff3b30', s=70, linewidths=1.5, zorder=21)
 
-        # 地図表示のズーム設定
-        ax.set_xlim(lim_w, lim_e)
+        # 右側の情報を入れるための余白確保
+        sidebar_ratio = 0.30
+        total_lon_range = (lim_e - lim_w) / (1 - sidebar_ratio)
+        lim_e_new = lim_w + total_lon_range
+        ax.set_xlim(lim_w, lim_e_new)
         ax.set_ylim(lim_s, lim_n)
 
-        # 情報表示
-        info_text = f"発生: {time_str}\n震央地名: {epicenter_name}\n深さ: {depth}\n規模: M{magnitude}"
-        plt.text(0.02, 0.98, "地震情報 (震源・震度詳細)", transform=ax.transAxes,
-                color='white', fontsize=20, fontweight='bold', va='top')
-        plt.text(0.02, 0.88, info_text, transform=ax.transAxes,
-                color='#d1d1d6', fontsize=14, va='top', bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'))
+        # --- UIパネル (transAxes) ---
 
-        # 凡例の作成
-        legend_elements = []
-        from matplotlib.lines import Line2D
-        legend_elements.append(
-            Line2D([0], [0], marker='x', color='w', label='震央',
-            markerfacecolor='#ff3b30', markeredgecolor='#ff3b30',
-            markersize=10, linestyle='None', markeredgewidth=3)
-        )
+        # 右側情報パネルの背景
+        panel_rect = mpatches.Rectangle((1-sidebar_ratio, 0), sidebar_ratio, 1.0,
+                                    transform=ax.transAxes, color='#000000', alpha=0.75, zorder=25)
+        ax.add_patch(panel_rect)
 
-        order = ["7", "6+", "6-", "5+", "5-", "4", "3", "2", "1"]
-        for level in order:
-            if level in INTENSITY_COLORS:
-                legend_elements.append(mpatches.Patch(color=INTENSITY_COLORS[level],
-                                                    label=f"震度 {INTENSITY_LABELS[level]}"))
+        # 左上タイトル部
+        ax.text(0.02, 0.95, "各地の震度情報", transform=ax.transAxes, color='#ffffff', fontsize=24, fontweight='bold', va='top', zorder=30)
+        ax.text(0.02, 0.90, "Seismic Intensity Report", transform=ax.transAxes, color='#ffffff', fontsize=12, va='top', zorder=30)
+        ax.text(0.02, 0.86, announce_time, transform=ax.transAxes, color='#ffffff', fontsize=14, va='top', zorder=30)
 
-        ax.legend(
-            handles=legend_elements, loc='lower right', bbox_to_anchor=(0.99, 0.08),
-            facecolor='#1c1c1e', edgecolor='#3a3a3c', labelcolor='white', fontsize=10
-        )
+        # 右側詳細パネル
+        panel_x = 1 - sidebar_ratio + 0.01
+        val_x = 0.99
+        label_fs = 14
+        sub_label_fs = 9
+        value_fs = 36
 
-        # クレジット表記
-        plt.text(0.98, 0.02, "気象庁防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）を加工", transform=ax.transAxes,
-                color='#8e8e93', fontsize=7, ha='right', va='bottom')
+        # 最大震度
+        ax.text(panel_x, 0.92, "最大震度", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
+        ax.text(panel_x, 0.895, "Max Intensity", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
+        ax.text(val_x, 0.92, INTENSITY_DISPLAY_NAMES.get(max_int, max_int), transform=ax.transAxes, color='#ffffff',
+                fontsize=value_fs, fontweight='bold', ha='right', va='top', zorder=30)
+
+        # 規模
+        ax.text(panel_x, 0.84, "規模", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
+        ax.text(panel_x, 0.815, "Magnitude", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
+        ax.text(val_x, 0.84, f"{magnitude}", transform=ax.transAxes, color='#ffffff',
+                fontsize=value_fs, fontweight='bold', ha='right', va='top', zorder=30)
+
+        # 発生時刻
+        try:
+            # ISO形式 (YYYY-MM-DD HH:MM:SS) を想定
+            dt_obj = datetime.datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
+            d_str = dt_obj.strftime('%m月%d日')
+            t_str = dt_obj.strftime('%H:%M頃')
+        except:
+            # 万が一パースに失敗した場合はそのまま表示 (ただし右端から)
+            d_str = time_str
+            t_str = ""
+
+        ax.text(panel_x, 0.76, "発生時刻", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
+        ax.text(panel_x, 0.735, "Date", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
+        ax.text(val_x, 0.76, d_str, transform=ax.transAxes, color='#ffffff', fontsize=18, fontweight='bold', ha='right', va='top', zorder=30)
+        ax.text(val_x, 0.725, t_str, transform=ax.transAxes, color='#ffffff', fontsize=18, fontweight='bold', ha='right', va='top', zorder=30)
+
+        # 震源地
+        ax.text(panel_x, 0.66, "震源地", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
+        ax.text(panel_x, 0.635, "Epicenter", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
+        ax.text(val_x, 0.62, epicenter_name, transform=ax.transAxes, color='#ffffff',
+                fontsize=18, fontweight='bold', ha='right', va='top', zorder=30)
+
+        # 深さ
+        ax.text(panel_x, 0.56, "深さ", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
+        ax.text(panel_x, 0.535, "Depth", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
+        ax.text(val_x, 0.52, depth, transform=ax.transAxes, color='#ffffff',
+                fontsize=18, fontweight='bold', ha='right', va='top', zorder=30)
+
+        # 津波
+        tsunami_display = tsunami_text
+        if any(x in tsunami_text for x in ["津波の心配はありません", "詳細はありません", "失敗しました"]):
+            tsunami_display = "心配なし"
+        elif "津波注意報" in tsunami_text:
+            tsunami_display = "津波注意報"
+
+        ax.text(panel_x, 0.46, "津波", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
+        ax.text(panel_x, 0.435, "Tsunami", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
+        ax.text(val_x, 0.42, tsunami_display, transform=ax.transAxes, color='#ffffff',
+                fontsize=18, fontweight='bold', ha='right', va='top', zorder=30)
+
+        # 凡例表示エリアの背景
+        legend_bg_y = 0.02
+        legend_h = 0.33
+        legend_w = sidebar_ratio * 0.60
+        legend_lx = 1.0 - legend_w - 0.01
+        legend_bg = mpatches.Rectangle((legend_lx, legend_bg_y), legend_w, legend_h,
+                                    transform=ax.transAxes, color='#1c1c1e', alpha=0.9, zorder=26)
+        ax.add_patch(legend_bg)
+
+        # 凡例項目
+        lx_icon = legend_lx + 0.02
+        lx_text = 0.985
+        ly_step = 0.031
+        curr_y = legend_bg_y + legend_h - 0.035
+        box_w, box_h = 0.022, 0.025
+
+        # 1. 震央
+        ax.scatter(lx_icon + box_w/2, curr_y + box_h/2, transform=ax.transAxes, marker='x', color='#ffffff', s=80, linewidths=2.5, zorder=31)
+        ax.scatter(lx_icon + box_w/2, curr_y + box_h/2, transform=ax.transAxes, marker='x', color='#ff3b30', s=70, linewidths=1.5, zorder=32)
+        ax.text(lx_text, curr_y + box_h/2, "震央　　", transform=ax.transAxes, color='#ffffff', fontsize=11, ha='right', va='center', zorder=30)
+        curr_y -= ly_step
+
+        # 2. 震度リスト
+        legend_levels = [
+            ("7", "震度７　"), ("6+", "震度６強"), ("6-", "震度６弱"),
+            ("5+", "震度５強"), ("5-", "震度５弱"), ("4", "震度４　"),
+            ("3", "震度３　"), ("2", "震度２　"), ("1", "震度１　")
+        ]
+
+        box_w, box_h = 0.022, 0.025
+        for code, label_text in legend_levels:
+            # アイコン
+            rect = mpatches.Rectangle((lx_icon, curr_y), box_w, box_h, transform=ax.transAxes,
+                                    color=INTENSITY_COLORS.get(code, "#ffffff"),
+                                    ec='#000000', lw=0.5, zorder=31)
+            ax.add_patch(rect)
+            ax.text(lx_icon + box_w/2, curr_y + box_h/2, INTENSITY_LABELS.get(code, code), transform=ax.transAxes,
+                    color='#000000' if code in ["1","2","4","5-","5+"] else '#ffffff',
+                    fontsize=8, fontweight='bold', ha='center', va='center', zorder=32)
+            # テキスト (右寄せで強・弱を揃える)
+            ax.text(lx_text, curr_y + box_h/2, label_text, transform=ax.transAxes,
+                    color='#ffffff', fontsize=11, ha='right', va='center', zorder=30)
+            curr_y -= ly_step
+
+        # クレジット
+        ax.text(0.012, 0.015, "気象庁防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）を加工",
+                transform=ax.transAxes, color='#8e8e93', fontsize=6, ha='left', va='bottom', zorder=30)
 
         ax.set_axis_off()
 
         buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=150, facecolor=fig.get_facecolor(), bbox_inches='tight')
+        plt.savefig(buf, format='png', dpi=144, facecolor=fig.get_facecolor(), bbox_inches='tight')
         buf.seek(0)
         plt.close(fig)
         return buf
