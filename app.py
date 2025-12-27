@@ -156,9 +156,9 @@ class EarthquakeMonitor:
             # マグニチュード
             magnitude_data = earthquake.get('jmx_eb:Magnitude', {})
             if isinstance(magnitude_data, dict):
-                magnitude = magnitude_data.get('#text', 'M不明')
+                magnitude = magnitude_data.get('#text', '不明')
             else:
-                magnitude = magnitude_data or 'M不明'
+                magnitude = magnitude_data or '不明'
 
             origin_time = earthquake.get('OriginTime', '') or head.get('TargetDateTime', '')
 
@@ -334,8 +334,8 @@ class EarthquakeMonitor:
         ax.set_facecolor('#0a0a0b')
         fig.patch.set_facecolor('#0a0a0b')
 
-        # 描画
-        relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2)
+        # 描画 (市町村区域は透明度70%)
+        relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2, alpha=0.6)
 
         for _, row in relevant_gdf.iterrows():
             intensity = get_intensity_value(row)
