@@ -643,7 +643,7 @@ def lambda_handler(event, context):
     entries = monitor.fetch_feed()
 
     # 処理対象のタイトル
-    TARGET_TITLES = ["震源・震度に関する情報", "震度速報", "遠地地震に関する情報"]
+    TARGET_TITLES = ["震源・震度に関する情報"]  #, "震度速報", "遠地地震に関する情報"]
 
     # 初回の状態を保持
     orig_last_id = monitor.last_event_id
