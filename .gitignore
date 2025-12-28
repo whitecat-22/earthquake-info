@@ -208,3 +208,5 @@ __marimo__/
 
 city.geojson
 city.parquet
+nation.geojson
+nation.parquet

@@ -50,6 +50,7 @@ S3_KEY = os.getenv("S3_KEY")
 JMA_FEED_URL = os.getenv("JMA_FEED_URL")
 GEOJSON_PATH = os.getenv("GEOJSON_PATH")
 PARQUET_PATH = GEOJSON_PATH.replace('.geojson', '.parquet') if GEOJSON_PATH else 'city.parquet'
+NATION_PARQUET_PATH = 'nation.parquet'
 APP_MODE = os.getenv("APP_MODE", "production") # 'production' or 'test'
 
 # 震度別の色定義
@@ -89,6 +90,7 @@ class EarthquakeMonitor:
         self.session = requests.Session() # コネクションプーリングで高速化
         print(f"Loaded state from S3: ID={self.last_event_id}, Time={self.last_event_time}")
         self.gdf_japan = None
+        self.gdf_nation = None
 
 
     def _load_state(self):
@@ -282,6 +284,15 @@ class EarthquakeMonitor:
                     self.gdf_japan = gpd.read_file(GEOJSON_PATH)
                 print("Map data loaded successfully.")
 
+            if self.gdf_nation is None:
+                if os.path.exists(NATION_PARQUET_PATH):
+                    print(f"Loading Nation Parquet from {NATION_PARQUET_PATH}...")
+                    self.gdf_nation = gpd.read_parquet(NATION_PARQUET_PATH)
+                    print("Nation map data loaded successfully.")
+                else:
+                    print(f"Warning: {NATION_PARQUET_PATH} not found. Inset map will use main data.")
+                    self.gdf_nation = self.gdf_japan
+
             # 緊急地震速報（EEW）の有無を確認
             is_eew = "緊急地震速報を発表しています" in headline_text or "緊急地震速報を発表しています" in tsunami_text
 
@@ -339,35 +350,49 @@ class EarthquakeMonitor:
         if not active_gdf.empty:
             active_points.extend(list(zip(active_gdf['rep_x'], active_gdf['rep_y'])))
 
-        for st in station_data:
-            active_points.append((st['lon'], st['lat']))
-
         if active_points:
             lons_all, lats_all = zip(*active_points)
             min_lon, max_lon = min(lons_all), max(lons_all)
             min_lat, max_lat = min(lats_all), max(lats_all)
 
-            margin_x = max((max_lon - min_lon) * 0.15, 1.2)
-            margin_y = max((max_lat - min_lat) * 0.15, 1.2)
+            d_lat = max_lat - min_lat
+            d_lon = max_lon - min_lon
 
-            if (max_lon - min_lon) < 4.0:
-                mid_x = (max_lon + min_lon) / 2
-                min_lon, max_lon = mid_x - 2.0, mid_x + 2.0
-            if (max_lat - min_lat) < 4.0:
-                mid_y = (max_lat + min_lat) / 2
-                min_lat, max_lat = mid_y - 2.0, mid_y + 2.0
+            import numpy as np
+            cos_lat = np.cos(np.radians((max_lat + min_lat) / 2))
 
-            lim_w, lim_e = min_lon - margin_x, max_lon + margin_x
-            lim_s, lim_n = min_lat - margin_y, max_lat + margin_y
+            # 地理的なスパンを決定 (最小 2.5度)
+            span_lat = max(d_lat * 1.3, 2.5)
+            span_lon = max(d_lon * 1.3, 2.5 / cos_lat)
+
+            # 中心から範囲を設定
+            center_lat = (max_lat + min_lat) / 2
+            center_lon = (max_lon + min_lon) / 2
+
+            lim_w, lim_e = center_lon - span_lon/2, center_lon + span_lon/2
+            lim_s, lim_n = center_lat - span_lat/2, center_lat + span_lat/2
+
+            # マップ領域の物理的なアスペクト比
+            map_aspect = (span_lon * cos_lat) / span_lat
+
+            fig_h = 10.8  # 高さを固定
+            map_w = fig_h * map_aspect
+            sidebar_w = 4.8 # サイドバー幅を固定
+            total_w = map_w + sidebar_w
+
+            fig, ax = plt.subplots(figsize=(total_w, fig_h))
+            sidebar_ratio = sidebar_w / total_w
 
             relevant_gdf = gdf.cx[lim_w:lim_e, lim_s:lim_n].copy()
         else:
+            # デフォルト表示
             lim_w, lim_e = 128, 146
             lim_s, lim_n = 30, 46
+            sidebar_ratio = 0.25
+            fig, ax = plt.subplots(figsize=(19.2, 10.8))
             relevant_gdf = gdf.copy()
 
         # 震度判定用のマッピングテーブルを事前に作成 (高速化)
-        # ID優先で検索するための辞書
         gdf_cols = [c for c in ['code', 'CODE', 'N03_007', 'name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004'] if c in gdf.columns]
 
         def precalculate_intensity(row):
@@ -382,9 +407,6 @@ class EarthquakeMonitor:
 
         # 描画対象 (震度がある地域) を抽出
         active_regions = relevant_gdf[relevant_gdf['intensity'].notna()].copy()
-
-        # 16:9 (1920x1080)
-        fig, ax = plt.subplots(figsize=(19.2, 10.8))
 
         # 背景色
         bg_color = '#001f41'
@@ -418,43 +440,43 @@ class EarthquakeMonitor:
             ax.scatter(lon, lat, marker='x', color='#ffffff', s=80, linewidths=2.5, zorder=20)
             ax.scatter(lon, lat, marker='x', color='#ff3b30', s=70, linewidths=1.5, zorder=21)
 
-        # 右側の情報を入れるための余白確保
-        sidebar_ratio = 0.30
-        total_lon_range = (lim_e - lim_w) / (1 - sidebar_ratio)
-        lim_e_new = lim_w + total_lon_range
-        ax.set_xlim(lim_w, lim_e_new)
+        # 右側の情報を入れるための余白確保 (既に算出済み)
+
+        # axの位置を明示的に指定して（左側75%）、UI配置の基準を作る
+        ax.set_position([0, 0, 1 - sidebar_ratio, 1.0])
+        ax.set_xlim(lim_w, lim_e)
         ax.set_ylim(lim_s, lim_n)
 
-        # --- UIパネル (transAxes) ---
+        # --- UIパネル (fig.text を使用して視認性を最大化) ---
 
-        # 右側情報パネルの背景
-        panel_rect = mpatches.Rectangle((1-sidebar_ratio, 0), sidebar_ratio, 1.0,
-                                    transform=ax.transAxes, color='#000000', alpha=0.75, zorder=25)
-        ax.add_patch(panel_rect)
+        # 右側情報パネルの背景 (zorderを下げて文字が埋もれないようにする)
+        panel_rect = mpatches.Rectangle((1 - sidebar_ratio, 0), sidebar_ratio, 1.0,
+                                    transform=fig.transFigure, color='#000000', alpha=0.9, zorder=10)
+        fig.patches.append(panel_rect)
 
-        # 左上タイトル部
-        ax.text(0.02, 0.95, "各地の震度情報", transform=ax.transAxes, color='#ffffff', fontsize=24, fontweight='bold', va='top', zorder=30)
-        ax.text(0.02, 0.90, "Seismic Intensity Report", transform=ax.transAxes, color='#ffffff', fontsize=12, va='top', zorder=30)
-        ax.text(0.02, 0.86, announce_time, transform=ax.transAxes, color='#ffffff', fontsize=14, va='top', zorder=30)
+        # 左上タイトル部 (fig.text で確実に前面に白文字を出す)
+        fig.text(0.02, 0.95, "各地の震度情報", color='#ffffff', fontsize=24, fontweight='bold', va='top', zorder=100)
+        fig.text(0.02, 0.90, "Seismic Intensity Report", color='#ffffff', fontsize=12, va='top', zorder=100)
+        fig.text(0.02, 0.86, announce_time, color='#ffffff', fontsize=14, va='top', zorder=100)
 
-        # 右側詳細パネル
-        panel_x = 1 - sidebar_ratio + 0.01
-        val_x = 0.99
-        label_fs = 14
-        sub_label_fs = 9
-        value_fs = 36
+        # 右側詳細パネルの基準座標
+        panel_x = 1 - sidebar_ratio + 0.02 # 左余白
+        val_x = 0.98 # 右余白
+        label_fs = 18
+        sub_label_fs = 12
+        value_fs = 34
 
         # 最大震度
-        ax.text(panel_x, 0.96, "最大震度", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
-        ax.text(panel_x, 0.935, "Max Intensity", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
-        ax.text(val_x, 0.96, INTENSITY_DISPLAY_NAMES.get(max_int, max_int), transform=ax.transAxes, color='#ffffff',
-                fontsize=value_fs, fontweight='bold', ha='right', va='top', zorder=30)
+        fig.text(panel_x, 0.95, "最大震度", color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
+        fig.text(panel_x, 0.925, "Max Intensity", color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
+        fig.text(val_x, 0.95, INTENSITY_DISPLAY_NAMES.get(max_int, max_int), color='#ffffff',
+                fontsize=value_fs, fontweight='bold', ha='right', va='top', zorder=1000)
 
         # 規模
-        ax.text(panel_x, 0.88, "規模", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
-        ax.text(panel_x, 0.855, "Magnitude", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
-        ax.text(val_x, 0.88, f"{magnitude}", transform=ax.transAxes, color='#ffffff',
-                fontsize=value_fs, fontweight='bold', ha='right', va='top', zorder=30)
+        fig.text(panel_x, 0.86, "規模", color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
+        fig.text(panel_x, 0.835, "Magnitude", color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
+        fig.text(val_x, 0.86, f"{magnitude}", color='#ffffff',
+                fontsize=value_fs, fontweight='bold', ha='right', va='top', zorder=1000)
 
         # 発生時刻
         try:
@@ -467,22 +489,22 @@ class EarthquakeMonitor:
             d_str = time_str
             t_str = ""
 
-        ax.text(panel_x, 0.80, "発生時刻", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
-        ax.text(panel_x, 0.775, "Date", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
-        ax.text(val_x, 0.80, d_str, transform=ax.transAxes, color='#ffffff', fontsize=18, fontweight='bold', ha='right', va='top', zorder=30)
-        ax.text(val_x, 0.765, t_str, transform=ax.transAxes, color='#ffffff', fontsize=18, fontweight='bold', ha='right', va='top', zorder=30)
+        fig.text(panel_x, 0.77, "発生時刻", color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
+        fig.text(panel_x, 0.745, "Date", color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
+        fig.text(val_x, 0.77, d_str, color='#ffffff', fontsize=18, fontweight='bold', ha='right', va='top', zorder=1000)
+        fig.text(val_x, 0.735, t_str, color='#ffffff', fontsize=18, fontweight='bold', ha='right', va='top', zorder=1000)
 
         # 震源地
-        ax.text(panel_x, 0.70, "震源地", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
-        ax.text(panel_x, 0.675, "Epicenter", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
-        ax.text(val_x, 0.66, epicenter_name, transform=ax.transAxes, color='#ffffff',
-                fontsize=18, fontweight='bold', ha='right', va='top', zorder=30)
+        fig.text(panel_x, 0.67, "震源地", color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
+        fig.text(panel_x, 0.645, "Epicenter", color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
+        fig.text(val_x, 0.63, epicenter_name, color='#ffffff',
+                fontsize=17, fontweight='bold', ha='right', va='top', zorder=1000)
 
         # 深さ
-        ax.text(panel_x, 0.60, "深さ", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
-        ax.text(panel_x, 0.575, "Depth", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
-        ax.text(val_x, 0.56, depth, transform=ax.transAxes, color='#ffffff',
-                fontsize=18, fontweight='bold', ha='right', va='top', zorder=30)
+        fig.text(panel_x, 0.57, "深さ", color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
+        fig.text(panel_x, 0.545, "Depth", color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
+        fig.text(val_x, 0.53, depth, color='#ffffff',
+                fontsize=18, fontweight='bold', ha='right', va='top', zorder=1000)
 
         # 津波
         tsunami_display = tsunami_text
@@ -492,13 +514,14 @@ class EarthquakeMonitor:
             tsunami_display = "調査中"
         elif "津波注意報" in tsunami_text:
             tsunami_display = "津波注意報"
-        ax.text(panel_x, 0.50, "津波", transform=ax.transAxes, color='#ffffff', fontsize=label_fs, va='top', zorder=30)
-        ax.text(panel_x, 0.475, "Tsunami", transform=ax.transAxes, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=30)
+        # 津波
+        fig.text(panel_x, 0.47, "津波", color='white', fontsize=label_fs, va='top', zorder=1000)
+        fig.text(panel_x, 0.445, "Tsunami", color='white', fontsize=sub_label_fs, va='top', zorder=1000)
 
-        # テキスト幅に合わせて折り返し (全角文字を考慮して幅を設定)
-        wrapped_tsunami = textwrap.fill(tsunami_display, width=18)
-        ax.text(val_x, 0.46, wrapped_tsunami, transform=ax.transAxes, color='#ffffff',
-                fontsize=16, fontweight='bold', ha='right', va='top', zorder=30)
+        # テキスト幅に合わせて折り返し
+        wrapped_tsunami = textwrap.fill(tsunami_display, width=16)
+        fig.text(val_x, 0.43, wrapped_tsunami, color='white',
+                fontsize=15, fontweight='bold', ha='right', va='top', zorder=1000)
 
         # 凡例表示エリアの背景 (津波情報が長くなる可能性があるため一旦コメントアウト)
         # legend_bg_y = 0.02
@@ -545,8 +568,8 @@ class EarthquakeMonitor:
         #     curr_y -= ly_step
 
         # クレジット
-        ax.text(0.012, 0.015, "気象庁防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）を加工",
-                transform=ax.transAxes, color='#8e8e93', fontsize=6, ha='left', va='bottom', zorder=30)
+        fig.text(0.012, 0.015, "気象庁防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）を加工",
+                color='#8e8e93', fontsize=6, ha='left', va='bottom', zorder=100)
 
         # 緊急地震速報（EEW）のメッセージ表示 (TBSリファレンス風)
         if is_eew:
@@ -558,10 +581,33 @@ class EarthquakeMonitor:
             ax.text(0.02, 0.08, eew_msg, transform=ax.transAxes, color='#ffff00',
                     fontsize=18, fontweight='bold', va='center', zorder=40)
 
+        # 10. インセットマップ (日本全体図) の追加
+        # 右下側の情報パネル内に収まるように配置 (Figure座標で指定)
+        inset_w = sidebar_ratio * 0.85
+        inset_h = 0.20
+        inset_lx = 1.0 - sidebar_ratio + (sidebar_ratio - inset_w) / 2
+        inset_pos = [inset_lx, 0.04, inset_w, inset_h] # [left, bottom, width, height]
+        inset_ax = fig.add_axes(inset_pos, zorder=50)
+
+        # 日本全体のデータを描画 (事前統合済みの nation.parquet を使用)
+        self.gdf_nation.plot(ax=inset_ax, color='#ffffff', edgecolor='#2c2c2e', linewidth=0.1, alpha=0.8)
+
+        # メインマップの範囲を赤枠で示す
+        # メインマップの範囲を日本全体図上に投影
+        overview_rect = mpatches.Rectangle((lim_w, lim_s), lim_e - lim_w, lim_n - lim_s,
+                                        edgecolor='#ff3b30', facecolor='none', linewidth=1.5, zorder=40)
+        inset_ax.add_patch(overview_rect)
+
+        # インセットマップの表示範囲とスタイル設定 (北方領土・南西諸島を含む範囲)
+        inset_ax.set_xlim(122, 149) # 与那国島から北方領土まで
+        inset_ax.set_ylim(24, 46)
+        inset_ax.set_axis_off()
+        inset_ax.set_facecolor('none')
+
         ax.set_axis_off()
 
         buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=144, facecolor=fig.get_facecolor(), bbox_inches='tight')
+        plt.savefig(buf, format='png', dpi=144, facecolor=fig.get_facecolor())
         buf.seek(0)
         plt.close(fig)
         return buf

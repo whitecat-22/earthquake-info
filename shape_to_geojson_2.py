@@ -58,7 +58,7 @@ def finish_conversion(input_zip_path, output_geojson_path):
         # 6. 出力
         print(f"3. 書き出し中: {output_geojson_path} ...")
         gdf_export.to_file(output_geojson_path, driver='GeoJSON')
-        print("★ 変換が完了しました！ city.geojson を確認してください。")
+        print("★ 変換が完了しました！ nation.geojson を確認してください。")
 
     except Exception as e:
         print(f"エラー: {e}")
@@ -68,6 +68,6 @@ def finish_conversion(input_zip_path, output_geojson_path):
             shutil.rmtree(extract_dir)
 
 if __name__ == "__main__":
-    INPUT_FILE = "20241128_AreaInformationCity_quake_GIS.zip"
-    OUTPUT_FILE = "city.geojson"
+    INPUT_FILE = "20190125_AreaForecastEEW_GIS.zip"
+    OUTPUT_FILE = "nation.geojson"
     finish_conversion(INPUT_FILE, OUTPUT_FILE)
