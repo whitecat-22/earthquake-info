@@ -306,7 +306,7 @@ class EarthquakeMonitor:
             lon_label = f"東経{lon}度" if lon >= 0 else f"西経{abs(lon)}度"
             coords_str = f"{lat_label} / {lon_label}"
 
-            # Slack通知 (最大震度を追加)
+            # Slack通知
             max_int_label = INTENSITY_DISPLAY_NAMES.get(max_intensity, max_intensity)
             self.send_to_slack(headline_text, epicenter_name, coords_str, max_int_label, magnitude, depth, formatted_time, tsunami_text, image_buf)
 
@@ -334,7 +334,7 @@ class EarthquakeMonitor:
                     return regional_intensities[n]
             return None
 
-        # 1. 表示範囲の計算 (ベクトル演算でマッチング)
+        # 表示範囲の計算 (ベクトル演算でマッチング)
         active_points = []
         if lon and lat:
             active_points.append((lon, lat))
@@ -392,48 +392,60 @@ class EarthquakeMonitor:
             fig, ax = plt.subplots(figsize=(19.2, 10.8))
             relevant_gdf = gdf.copy()
 
-        # 震度判定用のマッピングテーブルを事前に作成 (高速化)
-        gdf_cols = [c for c in ['code', 'CODE', 'N03_007', 'name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004'] if c in gdf.columns]
+        # 震度判定用のテーブルをベクトル演算で作成 (高速化)
+        lookup = {str(k): v for k, v in regional_intensities.items()}
+        # 可能性がある検索カラム
+        search_cols = [c for c in ['code', 'CODE', 'N03_007', 'name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004'] if c in relevant_gdf.columns]
 
-        def precalculate_intensity(row):
-            for col in gdf_cols:
-                val = str(row[col])
-                if val in regional_intensities:
-                    return regional_intensities[val]
-            return None
+        # 最初に見つかった情報で埋める (ベクトル演算)
+        relevant_gdf['intensity'] = None
+        for col in search_cols:
+            relevant_gdf['intensity'] = relevant_gdf['intensity'].fillna(relevant_gdf[col].astype(str).map(lookup))
 
-        relevant_gdf['intensity'] = relevant_gdf.apply(precalculate_intensity, axis=1)
         relevant_gdf['color'] = relevant_gdf['intensity'].map(lambda x: INTENSITY_COLORS.get(x, "#7c7c7c"))
-
-        # 描画対象 (震度がある地域) を抽出
-        active_regions = relevant_gdf[relevant_gdf['intensity'].notna()].copy()
 
         # 背景色
         bg_color = '#001f41'
         ax.set_facecolor(bg_color)
         fig.patch.set_facecolor(bg_color)
 
-        # 3. 描画
+        # 描画 (地図ポリゴン)
         relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2, alpha=0.6)
 
-        # 震度アイコン (一括処理に近い形でループを回す)
-        for _, row in active_regions.iterrows():
-            val = row['intensity']
-            color = INTENSITY_COLORS.get(val, "#ffffff")
-            label = INTENSITY_LABELS.get(val, val)
-            ax.plot(row['rep_x'], row['rep_y'], marker='s', markersize=12, color=color,
-                    markeredgecolor='#000000', markeredgewidth=0.5, zorder=8)
-            ax.text(row['rep_x'], row['rep_y'], label, color='#000000' if val in ["1","2","4","5-","5+"] else '#ffffff',
-                    fontsize=8, ha='center', va='center', fontweight='bold', zorder=9)
+        # 震度アイコンの描画 (震度レベルごとにまとめて描画することで高速化)
+        active_regions = relevant_gdf[relevant_gdf['intensity'].notna()]
+        for code in INTENSITY_DISPLAY_NAMES.keys():
+            subset = active_regions[active_regions['intensity'] == code]
+            if subset.empty: continue
 
-        # 観測点座標
-        for st in station_data:
-            color = INTENSITY_COLORS.get(st['intensity'], "#ffffff")
-            label = INTENSITY_LABELS.get(st['intensity'], st['intensity'])
-            ax.plot(st['lon'], st['lat'], marker='o', markersize=10, color=color,
-                    markeredgecolor='#ffffff', markeredgewidth=0.8, zorder=10)
-            ax.text(st['lon'], st['lat'], label, color='#000000' if st['intensity'] in ["1","2","4","5-","5+"] else '#ffffff',
-                    fontsize=7, ha='center', va='center', fontweight='bold', zorder=11)
+            color = INTENSITY_COLORS.get(code, "#ffffff")
+            label = INTENSITY_LABELS.get(code, code)
+            text_color = '#000000' if code in ["1","2","4","5-","5+"] else '#ffffff'
+
+            # アイコン (四角形) 一括プロット
+            ax.scatter(subset['rep_x'], subset['rep_y'], marker='s', s=144, color=color,
+                    edgecolors='#000000', linewidths=0.5, zorder=8)
+
+            # テキスト描画
+            for _, row in subset.iterrows():
+                ax.text(row['rep_x'], row['rep_y'], label, color=text_color,
+                        fontsize=8, ha='center', va='center', fontweight='bold', zorder=9)
+
+        # 観測点座標 (震度レベルごとにまとめて描画)
+        for code in INTENSITY_DISPLAY_NAMES.keys():
+            pts = [st for st in station_data if st['intensity'] == code]
+            if not pts: continue
+
+            color = INTENSITY_COLORS.get(code, "#ffffff")
+            label = INTENSITY_LABELS.get(code, code)
+            text_color = '#000000' if code in ["1","2","4","5-","5+"] else '#ffffff'
+
+            lons = [p['lon'] for p in pts]
+            lats = [p['lat'] for p in pts]
+            ax.scatter(lons, lats, marker='o', s=100, color=color, edgecolors='#ffffff', linewidths=0.8, zorder=10)
+            for p in pts:
+                ax.text(p['lon'], p['lat'], label, color=text_color, fontsize=7,
+                        ha='center', va='center', fontweight='bold', zorder=11)
 
         # 震源地
         if lat and lon:
@@ -466,19 +478,7 @@ class EarthquakeMonitor:
         sub_label_fs = 12
         value_fs = 34
 
-        # 最大震度
-        fig.text(panel_x, 0.95, "最大震度", color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
-        fig.text(panel_x, 0.925, "Max Intensity", color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
-        fig.text(val_x, 0.95, INTENSITY_DISPLAY_NAMES.get(max_int, max_int), color='#ffffff',
-                fontsize=value_fs, fontweight='bold', ha='right', va='top', zorder=1000)
-
-        # 規模
-        fig.text(panel_x, 0.86, "規模", color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
-        fig.text(panel_x, 0.835, "Magnitude", color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
-        fig.text(val_x, 0.86, f"{magnitude}", color='#ffffff',
-                fontsize=value_fs, fontweight='bold', ha='right', va='top', zorder=1000)
-
-        # 発生時刻
+        # 発生時刻の文字列準備
         try:
             # ISO形式 (YYYY-MM-DD HH:MM:SS) を想定
             dt_obj = datetime.datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
@@ -489,24 +489,7 @@ class EarthquakeMonitor:
             d_str = time_str
             t_str = ""
 
-        fig.text(panel_x, 0.77, "発生時刻", color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
-        fig.text(panel_x, 0.745, "Date", color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
-        fig.text(val_x, 0.77, d_str, color='#ffffff', fontsize=18, fontweight='bold', ha='right', va='top', zorder=1000)
-        fig.text(val_x, 0.735, t_str, color='#ffffff', fontsize=18, fontweight='bold', ha='right', va='top', zorder=1000)
-
-        # 震源地
-        fig.text(panel_x, 0.67, "震源地", color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
-        fig.text(panel_x, 0.645, "Epicenter", color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
-        fig.text(val_x, 0.63, epicenter_name, color='#ffffff',
-                fontsize=17, fontweight='bold', ha='right', va='top', zorder=1000)
-
-        # 深さ
-        fig.text(panel_x, 0.57, "深さ", color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
-        fig.text(panel_x, 0.545, "Depth", color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
-        fig.text(val_x, 0.53, depth, color='#ffffff',
-                fontsize=18, fontweight='bold', ha='right', va='top', zorder=1000)
-
-        # 津波
+        # 津波の表示文字列準備
         tsunami_display = tsunami_text
         if any(x in tsunami_text for x in ["被害の心配はありません", "津波の心配はありません"]):
             tsunami_display = "被害の心配なし"
@@ -514,14 +497,26 @@ class EarthquakeMonitor:
             tsunami_display = "調査中"
         elif "津波注意報" in tsunami_text:
             tsunami_display = "津波注意報"
-        # 津波
-        fig.text(panel_x, 0.47, "津波", color='white', fontsize=label_fs, va='top', zorder=1000)
-        fig.text(panel_x, 0.445, "Tsunami", color='white', fontsize=sub_label_fs, va='top', zorder=1000)
-
-        # テキスト幅に合わせて折り返し
         wrapped_tsunami = textwrap.fill(tsunami_display, width=16)
-        fig.text(val_x, 0.43, wrapped_tsunami, color='white',
-                fontsize=15, fontweight='bold', ha='right', va='top', zorder=1000)
+
+        # メタデータによるサイドバーの構築 (効率化と保守性向上)
+        ui_items = [
+            ("最大震度", "Max Intensity", INTENSITY_DISPLAY_NAMES.get(max_int, max_int), 0.95, value_fs, True),
+            ("規模", "Magnitude", f"{magnitude}", 0.86, value_fs, True),
+            ("発生時刻", "Date", f"{d_str}\n{t_str}", 0.77, 18, True),
+            ("震源地", "Epicenter", epicenter_name, 0.67, 17, False),
+            ("深さ", "Depth", depth, 0.57, 18, False),
+            ("津波", "Tsunami", wrapped_tsunami, 0.47, 15, False)
+        ]
+
+        for label_jp, label_en, val_text, y_pos, val_fs_item, is_bold in ui_items:
+            fig.text(panel_x, y_pos, label_jp, color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
+            fig.text(panel_x, y_pos - 0.025, label_en, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
+
+            # 値の描画 (複数行対応)
+            ha = 'right'
+            fig.text(val_x, y_pos, val_text, color='#ffffff', fontsize=val_fs_item,
+                    fontweight='bold' if is_bold else 'normal', ha=ha, va='top', zorder=1000)
 
         # 凡例表示エリアの背景 (津波情報が長くなる可能性があるため一旦コメントアウト)
         # legend_bg_y = 0.02
