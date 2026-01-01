@@ -210,3 +210,6 @@ city.geojson
 city.parquet
 nation.geojson
 nation.parquet
+lake.parquet
+unified_data_nation.parquet
+unified_data.parquet

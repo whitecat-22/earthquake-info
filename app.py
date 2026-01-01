@@ -15,6 +15,12 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
 
+# 正規表現のコンパイルとキャッシュ（高速化のため）
+# 観測点の座標パース用: +27.5+129.2 -> (lat, lon)
+_COORD_PATTERN_2 = re.compile(r'([+-][0-9.]+)([+-][0-9.]+)')
+# 震源地の座標パース用: +27.5+129.2-10000/ -> (lat, lon, depth)
+_COORD_PATTERN_3 = re.compile(r'([+-][0-9.]+)([+-][0-9.]+)([+-][0-9.]+)?')
+
 # Lambda環境でのMatplotlib書き込みエラー対策
 os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'
 import matplotlib
@@ -51,6 +57,9 @@ JMA_FEED_URL = os.getenv("JMA_FEED_URL")
 GEOJSON_PATH = os.getenv("GEOJSON_PATH")
 PARQUET_PATH = GEOJSON_PATH.replace('.geojson', '.parquet') if GEOJSON_PATH else 'city.parquet'
 NATION_PARQUET_PATH = 'nation.parquet'
+LAKE_PARQUET_PATH = 'lake.parquet'
+UNIFIED_PARQUET_PATH = 'unified_data.parquet'  # 統合データ（city + lake）
+UNIFIED_NATION_PARQUET_PATH = 'unified_data_nation.parquet'  # 統合全国データ
 APP_MODE = os.getenv("APP_MODE", "production") # 'production' or 'test'
 
 # 震度別の色定義
@@ -91,6 +100,7 @@ class EarthquakeMonitor:
         print(f"Loaded state from S3: ID={self.last_event_id}, Time={self.last_event_time}")
         self.gdf_japan = None
         self.gdf_nation = None
+        self.gdf_lakes = None
 
 
     def _load_state(self):
@@ -217,7 +227,7 @@ class EarthquakeMonitor:
                                 if isinstance(st_coord, dict): st_coord = st_coord.get('#text', '')
 
                                 if st_coord:
-                                    s_match = re.search(r'([+-][0-9.]+)([+-][0-9.]+)', st_coord)
+                                    s_match = _COORD_PATTERN_2.search(st_coord)
                                     if s_match:
                                         station_data.append({
                                             'name': st.get('Name'),
@@ -232,7 +242,8 @@ class EarthquakeMonitor:
             lat, lon, depth = None, None, "不明"
             if coord_str and isinstance(coord_str, str):
                 # 正規表現を拡張して深さ（3つ目の符号付き数値）もキャプチャ
-                match = re.search(r'([+-][0-9.]+)([+-][0-9.]+)([+-][0-9.]+)?', coord_str)
+                # コンパイル済み正規表現を使用（高速化）
+                match = _COORD_PATTERN_3.search(coord_str)
                 if match:
                     lat = float(match.group(1)) # WGS84 10進数 緯度
                     lon = float(match.group(2)) # WGS84 10進数 経度
@@ -275,17 +286,63 @@ class EarthquakeMonitor:
                         max_intensity = v
 
             # 地図画像生成
-            if self.gdf_japan is None:
-                if os.path.exists(PARQUET_PATH):
-                    print(f"Loading Parquet from {PARQUET_PATH}...")
-                    self.gdf_japan = gpd.read_parquet(PARQUET_PATH)
+            # 統合データを優先的に使用（高速化のため）
+            if self.gdf_japan is None or self.gdf_lakes is None:
+                if os.path.exists(UNIFIED_PARQUET_PATH):
+                    # 統合データから読み込み（1回のI/O操作でcityとlakeの両方を取得）
+                    print(f"Loading unified data from {UNIFIED_PARQUET_PATH}...")
+                    gdf_unified = gpd.read_parquet(UNIFIED_PARQUET_PATH)
+
+                    # data_typeでフィルタリングしてcityとlakeに分離
+                    if self.gdf_japan is None:
+                        self.gdf_japan = gdf_unified[gdf_unified['data_type'] == 'city'].copy()
+                        # data_typeカラムを削除（後続処理で不要）
+                        if 'data_type' in self.gdf_japan.columns:
+                            self.gdf_japan = self.gdf_japan.drop(columns=['data_type'])
+                        print(f"City data loaded: {len(self.gdf_japan)} polygons")
+
+                    if self.gdf_lakes is None:
+                        lake_data = gdf_unified[gdf_unified['data_type'] == 'lake']
+                        if not lake_data.empty:
+                            self.gdf_lakes = lake_data.copy()
+                            # data_typeカラムを削除
+                            if 'data_type' in self.gdf_lakes.columns:
+                                self.gdf_lakes = self.gdf_lakes.drop(columns=['data_type'])
+                            print(f"Lake data loaded: {len(self.gdf_lakes)} lakes")
+                        else:
+                            print("Warning: No lake data found in unified file.")
+                            self.gdf_lakes = None
+
+                    print("Unified data loaded successfully.")
                 else:
-                    print(f"Loading GeoJSON from {GEOJSON_PATH}...")
-                    self.gdf_japan = gpd.read_file(GEOJSON_PATH)
-                print("Map data loaded successfully.")
+                    # フォールバック: 個別ファイルから読み込み（後方互換性のため）
+                    print("Unified data not found. Loading individual files...")
+
+                    if self.gdf_japan is None:
+                        if os.path.exists(PARQUET_PATH):
+                            print(f"Loading Parquet from {PARQUET_PATH}...")
+                            self.gdf_japan = gpd.read_parquet(PARQUET_PATH)
+                        else:
+                            print(f"Loading GeoJSON from {GEOJSON_PATH}...")
+                            self.gdf_japan = gpd.read_file(GEOJSON_PATH)
+                        print("Map data loaded successfully.")
+
+                    if self.gdf_lakes is None:
+                        if os.path.exists(LAKE_PARQUET_PATH):
+                            print(f"Loading Lake Parquet from {LAKE_PARQUET_PATH}...")
+                            self.gdf_lakes = gpd.read_parquet(LAKE_PARQUET_PATH)
+                            print("Lake data loaded successfully.")
+                        else:
+                            print(f"Warning: {LAKE_PARQUET_PATH} not found. Lakes will not be displayed.")
+                            self.gdf_lakes = None
 
             if self.gdf_nation is None:
-                if os.path.exists(NATION_PARQUET_PATH):
+                # 統合全国データを優先的に使用
+                if os.path.exists(UNIFIED_NATION_PARQUET_PATH):
+                    print(f"Loading unified nation data from {UNIFIED_NATION_PARQUET_PATH}...")
+                    self.gdf_nation = gpd.read_parquet(UNIFIED_NATION_PARQUET_PATH)
+                    print("Unified nation map data loaded successfully.")
+                elif os.path.exists(NATION_PARQUET_PATH):
                     print(f"Loading Nation Parquet from {NATION_PARQUET_PATH}...")
                     self.gdf_nation = gpd.read_parquet(NATION_PARQUET_PATH)
                     print("Nation map data loaded successfully.")
@@ -393,14 +450,23 @@ class EarthquakeMonitor:
             relevant_gdf = gdf.copy()
 
         # 震度判定用のテーブルをベクトル演算で作成 (高速化)
+        # 震度マッチング用インデックス（ハッシュテーブル）を構築
         lookup = {str(k): v for k, v in regional_intensities.items()}
-        # 可能性がある検索カラム
-        search_cols = [c for c in ['code', 'CODE', 'N03_007', 'name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004'] if c in relevant_gdf.columns]
+
+        # 検索カラムの優先順位を定義（コード系を最優先、次に名称系）
+        # 優先順位が高い順に検索することで、高速化を図る
+        code_cols = [c for c in ['code', 'CODE', 'N03_007'] if c in relevant_gdf.columns]
+        name_cols = [c for c in ['name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004'] if c in relevant_gdf.columns]
+        search_cols = code_cols + name_cols  # コード系を先に検索
 
         # 最初に見つかった情報で埋める (ベクトル演算)
+        # fillnaを使用することで、既に見つかった値は上書きしない（優先順位の維持）
         relevant_gdf['intensity'] = None
         for col in search_cols:
-            relevant_gdf['intensity'] = relevant_gdf['intensity'].fillna(relevant_gdf[col].astype(str).map(lookup))
+            # ハッシュテーブル（lookup）によるO(1)検索
+            relevant_gdf['intensity'] = relevant_gdf['intensity'].fillna(
+                relevant_gdf[col].astype(str).map(lookup)
+            )
 
         relevant_gdf['color'] = relevant_gdf['intensity'].map(lambda x: INTENSITY_COLORS.get(x, "#7c7c7c"))
 
@@ -411,6 +477,16 @@ class EarthquakeMonitor:
 
         # 描画 (地図ポリゴン)
         relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2, alpha=0.6)
+
+        # 湖沼の描画（市区町村ポリゴンの上に重ねて表示）
+        if self.gdf_lakes is not None:
+            # 表示範囲内の湖沼のみをフィルタリング
+            relevant_lakes = self.gdf_lakes.cx[lim_w:lim_e, lim_s:lim_n].copy()
+            if not relevant_lakes.empty:
+                # 海の色（背景色#001f41）より若干明るい色を使用
+                # 震度2（#00AAFF）や震度3（#0041FF）と区別しやすいように、海っぽい濃い青系の色
+                lake_color = '#003D6B'  # 海より明るいが、震度の色とは明確に区別できる濃い青
+                relevant_lakes.plot(ax=ax, color=lake_color, edgecolor='#004A7F', linewidth=0.3, alpha=0.9, zorder=5)
 
         # 震度アイコンの描画 (震度レベルごとにまとめて描画することで高速化)
         active_regions = relevant_gdf[relevant_gdf['intensity'].notna()]

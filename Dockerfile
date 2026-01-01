@@ -16,8 +16,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 3. アプリケーションコードとデータをコピー
 COPY app.py ./
-COPY city.parquet ./
-COPY nation.parquet ./
+# 統合データを優先的に使用（高速化のため）
+# 個別ファイル（city.parquet, nation.parquet, lake.parquet）は削除し、
+# 統合データのみを保持することでDockerイメージサイズを削減
+COPY unified_data.parquet ./
+COPY unified_data_nation.parquet ./
 
 # 4. Lambdaハンドラを指定
 CMD ["app.lambda_handler"]
