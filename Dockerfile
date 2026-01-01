@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 3. アプリケーションコードと最適化済みデータのコピー
 COPY app.py .
 COPY optimized_unified_data.parquet .
+COPY optimized_unified_data_nation.parquet .
 COPY optimized_lake.parquet .
 
 # 4. Lambdaハンドラの設定

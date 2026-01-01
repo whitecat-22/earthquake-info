@@ -14,17 +14,16 @@ from io import BytesIO
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 正規表現のコンパイルとキャッシュ（高速化のため）
-# 観測点の座標パース用: +27.5+129.2 -> (lat, lon)
 _COORD_PATTERN_2 = re.compile(r'([+-][0-9.]+)([+-][0-9.]+)')
-# 震源地の座標パース用: +27.5+129.2-10000/ -> (lat, lon, depth)
 _COORD_PATTERN_3 = re.compile(r'([+-][0-9.]+)([+-][0-9.]+)([+-][0-9.]+)?')
 
 # Lambda環境でのMatplotlib書き込みエラー対策
 os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'
 import matplotlib
-matplotlib.use('Agg') # GUIなし環境向けのバックエンド
+matplotlib.use('Agg')
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 
@@ -32,7 +31,6 @@ _cached_font = None
 def setup_fonts():
     global _cached_font
     if _cached_font: return _cached_font
-    # Lambda環境とローカル環境の両方で利用可能なフォントを探す
     target_fonts = ["Noto Sans CJK JP", "Noto Sans JP", "IPAGothic", "IPAexGothic", "VL Gothic", "MS Gothic"]
     available_fonts = [f.name for f in fm.fontManager.ttflist]
 
@@ -55,12 +53,18 @@ S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 S3_KEY = os.getenv("S3_KEY")
 JMA_FEED_URL = os.getenv("JMA_FEED_URL")
 GEOJSON_PATH = os.getenv("GEOJSON_PATH")
-PARQUET_PATH = GEOJSON_PATH.replace('.geojson', '.parquet') if GEOJSON_PATH else 'city.parquet'
-NATION_PARQUET_PATH = 'nation.parquet'
-LAKE_PARQUET_PATH = 'lake.parquet'
-UNIFIED_PARQUET_PATH = 'unified_data.parquet'  # 統合データ（city + lake）
-UNIFIED_NATION_PARQUET_PATH = 'unified_data_nation.parquet'  # 統合全国データ
-APP_MODE = os.getenv("APP_MODE", "production") # 'production' or 'test'
+
+# --- 地図データ設定 (create_final_dataset.py の出力に対応) ---
+# メインの統合データ (City + Lake)
+UNIFIED_PARQUET_PATH = 'optimized_unified_data.parquet'
+# インセットマップ用全国データ
+UNIFIED_NATION_PARQUET_PATH = 'optimized_unified_data_nation.parquet'
+
+# フォールバック用 (統合データが無い場合に参照)
+LAKE_PARQUET_PATH = 'optimized_lake.parquet'
+PARQUET_PATH = 'city.parquet' # optimized_cityは生成されないため、デフォルト名を指定
+
+APP_MODE = os.getenv("APP_MODE", "production")
 
 # 震度別の色定義
 INTENSITY_COLORS = {
@@ -75,19 +79,16 @@ INTENSITY_COLORS = {
     "7": "#B40068",
 }
 
-# 震点アイコン内などの短い表記 (5+, 5-, etc.)
 INTENSITY_LABELS = {
     "1": "1", "2": "2", "3": "3", "4": "4",
     "5-": "5-", "5+": "5+", "6-": "6-", "6+": "6+", "7": "7"
 }
 
-# パネルなどのテキスト用表記 (5弱, 5強, etc.)
 INTENSITY_DISPLAY_NAMES = {
     "1": "1", "2": "2", "3": "3", "4": "4",
     "5-": "5弱", "5+": "5強", "6-": "6弱", "6+": "6強", "7": "7"
 }
 
-# JMA XML Namespace Definitions for lxml
 JMA_NS = {
     'atom': 'http://www.w3.org/2005/Atom',
     'jmx': 'http://xml.kishou.go.jp/jmaxml1/',
@@ -103,10 +104,9 @@ class EarthquakeMonitor:
     def __init__(self):
         state = self._load_state()
         self.last_event_id = state.get('id')
-        # 過去のフォーマット('updated')も考慮する
         self.last_event_time = state.get('event_time') or state.get('updated')
         self.slack_client = WebClient(token=SLACK_BOT_TOKEN)
-        self.session = requests.Session() # コネクションプーリングで高速化
+        self.session = requests.Session()
         print(f"Loaded state from S3: ID={self.last_event_id}, Time={self.last_event_time}")
         self.gdf_japan = None
         self.gdf_nation = None
@@ -147,9 +147,6 @@ class EarthquakeMonitor:
             print(f"Error saving state to S3: {e}")
 
     def fetch_feed(self):
-        """
-        lxmlを使用してAtomフィードをパースする
-        """
         if not JMA_FEED_URL:
             print("Error: JMA_FEED_URL is not set.")
             return []
@@ -157,18 +154,14 @@ class EarthquakeMonitor:
             response = self.session.get(JMA_FEED_URL, timeout=10)
             response.raise_for_status()
 
-            # lxmlによるパース
             root = etree.fromstring(response.content)
-
             entries = []
-            # namespaceを指定してentryタグを取得
+
             for entry_elem in root.xpath('//atom:entry', namespaces=JMA_NS):
-                # 安全にテキストを取得するヘルパー
                 def get_text(elem, path):
                     found = elem.xpath(path, namespaces=JMA_NS)
                     return found[0].text if found else ''
 
-                # 属性を取得するヘルパー
                 def get_attr(elem, path, attr):
                     found = elem.xpath(path, namespaces=JMA_NS)
                     return found[0].get(attr) if found else ''
@@ -195,38 +188,30 @@ class EarthquakeMonitor:
     def handle_detail(self, url, event_id):
         try:
             response = self.session.get(url, timeout=10)
-            # lxmlでパース
             root = etree.fromstring(response.content)
 
-            # XPathヘルパー
             def x_text(elem, path, default=''):
                 res = elem.xpath(path, namespaces=JMA_NS)
                 return res[0].text if res and res[0].text else default
 
-            # Head情報 (jmx:Head -> jmx_info:Head に変更)
-            # Headline や TargetDateTime も jmx_info プレフィックスを使用
             head_list = root.xpath('.//jmx_info:Head', namespaces=JMA_NS)
             if not head_list:
                 print("Error: No Head element found (namespace mismatch?).")
-                return
+                return {"success": False, "event_id": event_id, "error": "No Head element"}
             head = head_list[0]
 
             headline_text = x_text(head, './/jmx_info:Headline/jmx_info:Text')
             target_date_time = x_text(head, './/jmx_info:TargetDateTime')
 
-            # Body情報 (jmx:Body -> jmx_ib:Body に変更)
-            # 地震情報XMLではBodyタグ自体が seismology1 名前空間を持つことが多いため
             body_list = root.xpath('.//jmx_ib:Body', namespaces=JMA_NS)
             if not body_list:
-                # まれにBodyがルート名前空間(jmx)の場合もあるためフォールバック
                 body_list = root.xpath('.//jmx:Body', namespaces=JMA_NS)
 
             if not body_list:
                 print("Error: No Body element found.")
-                return
+                return {"success": False, "event_id": event_id, "error": "No Body element"}
             body = body_list[0]
 
-            # 震源情報の取得
             earthquake = body.xpath('.//jmx_ib:Earthquake', namespaces=JMA_NS)
             if earthquake:
                 earthquake = earthquake[0]
@@ -247,27 +232,23 @@ class EarthquakeMonitor:
                 epicenter_name = '不明'
                 coord_str = ''
 
-            # 津波情報の取得
-            tsunami_text = x_text(body, './/jmx:Comments/jmx:ForecastComment/jmx:Text', '津波情報の抽出に失敗しました。')
+            tsunami_text = x_text(body, './/jmx_ib:Comments/jmx_ib:ForecastComment/jmx_ib:Text')
+
+            # 見つからない場合は jmx (ルート名前空間) でフォールバック
+            if not tsunami_text:
+                tsunami_text = x_text(body, './/jmx:Comments/jmx:ForecastComment/jmx:Text')
+
             if not tsunami_text:
                 tsunami_text = "津波情報の詳細はありません。"
-                pass
 
-            # 震度情報の抽出 (詳細な観測データ & 市町村レベル)
             regional_intensities = {}
             station_data = []
 
-            # Intensityタグの処理
             intensity_elem = body.xpath('.//jmx_ib:Intensity', namespaces=JMA_NS)
             if intensity_elem:
                 intensity_elem = intensity_elem[0]
 
-                # Observation / Pref / Area / City / IntensityStation と階層を降りる
-                # lxmlのiterやfindallはリストを返すので、xmltodictのようなisinstanceチェックは不要
-
-                # 都道府県ループ
                 for pref in intensity_elem.xpath('.//jmx_ib:Observation/jmx_ib:Pref', namespaces=JMA_NS):
-                    # 細分区域(Area)ループ
                     for area in pref.xpath('jmx_ib:Area', namespaces=JMA_NS):
                         area_name = x_text(area, 'jmx_ib:Name')
                         area_code = x_text(area, 'jmx_ib:Code')
@@ -277,7 +258,6 @@ class EarthquakeMonitor:
                             if area_name: regional_intensities[area_name] = area_max
                             if area_code: regional_intensities[str(area_code)] = area_max
 
-                        # 市町村(City)ループ
                         for city in area.xpath('jmx_ib:City', namespaces=JMA_NS):
                             city_name = x_text(city, 'jmx_ib:Name')
                             city_code = x_text(city, 'jmx_ib:Code')
@@ -287,7 +267,6 @@ class EarthquakeMonitor:
                                 if city_name: regional_intensities[city_name] = city_max
                                 if city_code: regional_intensities[str(city_code)] = city_max
 
-                            # 観測点(IntensityStation)ループ
                             for st in city.xpath('jmx_ib:IntensityStation', namespaces=JMA_NS):
                                 st_name = x_text(st, 'jmx_ib:Name')
                                 st_int = x_text(st, 'jmx_ib:Int')
@@ -303,24 +282,20 @@ class EarthquakeMonitor:
                                             'lon': float(s_match.group(2))
                                         })
 
-            # 緯度経度・深さのパース
             lat, lon, depth = None, None, "不明"
             if coord_str:
                 match = _COORD_PATTERN_3.search(coord_str)
                 if match:
-                    lat = float(match.group(1)) # WGS84 10進数 緯度
-                    lon = float(match.group(2)) # WGS84 10進数 経度
+                    lat = float(match.group(1))
+                    lon = float(match.group(2))
                     if match.group(3):
                         depth_m = float(match.group(3))
-                        depth_km = abs(int(depth_m / 1000)) # mをkmに変換し、整数部を取得
-
-                        # 0kmの場合は「ごく浅い」と表記
+                        depth_km = abs(int(depth_m / 1000))
                         if depth_km == 0:
                             depth = "ごく浅い"
                         else:
                             depth = f"約{depth_km}km"
 
-            # 発表時刻のフォーマット
             def format_time(ts):
                 try:
                     dt = datetime.datetime.fromisoformat(ts.replace('Z', '+00:00'))
@@ -339,7 +314,6 @@ class EarthquakeMonitor:
                     return ts
             announcement_time = format_atime(target_date_time)
 
-            # 最大震度の特定
             max_intensity = "0"
             if regional_intensities:
                 order = {"0":0, "1":1, "2":2, "3":3, "4":4, "5-":5, "5+":6, "6-":7, "6+":8, "7":9}
@@ -349,22 +323,23 @@ class EarthquakeMonitor:
                         current_max_val = order[v]
                         max_intensity = v
 
-            # 地図描画用データのロード (既存ロジック維持)
+            # 地図データのロード
+            # create_final_dataset.py で生成された optimized_unified_data.parquet を優先的に使用
             if self.gdf_japan is None or self.gdf_lakes is None:
                 if os.path.exists(UNIFIED_PARQUET_PATH):
                     print(f"Loading unified data from {UNIFIED_PARQUET_PATH}...")
                     gdf_unified = gpd.read_parquet(UNIFIED_PARQUET_PATH)
+
+                    # data_type カラムで分割
                     if self.gdf_japan is None:
                         self.gdf_japan = gdf_unified[gdf_unified['data_type'] == 'city'].copy()
-                        if 'data_type' in self.gdf_japan.columns:
-                            self.gdf_japan = self.gdf_japan.drop(columns=['data_type'])
+                        # 不要なカラムは落とさない（ベクトル演算で使う可能性があるため）
                         print(f"City data loaded: {len(self.gdf_japan)} polygons")
+
                     if self.gdf_lakes is None:
                         lake_data = gdf_unified[gdf_unified['data_type'] == 'lake']
                         if not lake_data.empty:
                             self.gdf_lakes = lake_data.copy()
-                            if 'data_type' in self.gdf_lakes.columns:
-                                self.gdf_lakes = self.gdf_lakes.drop(columns=['data_type'])
                             print(f"Lake data loaded: {len(self.gdf_lakes)} lakes")
                         else:
                             self.gdf_lakes = None
@@ -374,8 +349,9 @@ class EarthquakeMonitor:
                     if self.gdf_japan is None:
                         if os.path.exists(PARQUET_PATH):
                             self.gdf_japan = gpd.read_parquet(PARQUET_PATH)
-                        else:
+                        elif GEOJSON_PATH and os.path.exists(GEOJSON_PATH):
                             self.gdf_japan = gpd.read_file(GEOJSON_PATH)
+
                     if self.gdf_lakes is None:
                         if os.path.exists(LAKE_PARQUET_PATH):
                             self.gdf_lakes = gpd.read_parquet(LAKE_PARQUET_PATH)
@@ -385,12 +361,9 @@ class EarthquakeMonitor:
             if self.gdf_nation is None:
                 if os.path.exists(UNIFIED_NATION_PARQUET_PATH):
                     self.gdf_nation = gpd.read_parquet(UNIFIED_NATION_PARQUET_PATH)
-                elif os.path.exists(NATION_PARQUET_PATH):
-                    self.gdf_nation = gpd.read_parquet(NATION_PARQUET_PATH)
                 else:
                     self.gdf_nation = self.gdf_japan
 
-            # 緊急地震速報（EEW）の有無を確認
             is_eew = "緊急地震速報を発表しています" in headline_text or "緊急地震速報を発表しています" in tsunami_text
 
             image_buf = self.generate_map(
@@ -398,24 +371,38 @@ class EarthquakeMonitor:
                 map_time_str, announcement_time, max_intensity, tsunami_text, is_eew
             )
 
-            # 緯度経度の表示用文字列作成
             lat_label = f"北緯{lat}度" if lat is not None and lat >= 0 else f"南緯{abs(lat)}度" if lat is not None else "不明"
             lon_label = f"東経{lon}度" if lon is not None and lon >= 0 else f"西経{abs(lon)}度" if lon is not None else "不明"
             coords_str = f"{lat_label} / {lon_label}"
 
-            # Slack通知
             max_int_label = INTENSITY_DISPLAY_NAMES.get(max_intensity, max_intensity)
-            self.send_to_slack(headline_text, epicenter_name, coords_str, max_int_label, magnitude, depth, formatted_time, tsunami_text, image_buf)
+
+            return {
+                "success": True,
+                "event_id": event_id,
+                "origin_time": origin_time,
+                "payload": {
+                    "headline": headline_text,
+                    "epicenter": epicenter_name,
+                    "coords": coords_str,
+                    "max_int": max_int_label,
+                    "magnitude": magnitude,
+                    "depth": depth,
+                    "time_str": formatted_time,
+                    "tsunami_text": tsunami_text,
+                    "image_buf": image_buf
+                }
+            }
 
         except Exception as e:
             print(f"Error processing detail: {e}")
             import traceback
             traceback.print_exc()
+            return {"success": False, "event_id": event_id, "error": str(e)}
 
     def generate_map(self, epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude, time_str, announce_time, max_int, tsunami_text, is_eew=False):
         gdf = self.gdf_japan
 
-        # 表示範囲の計算 (ベクトル演算でマッチング)
         active_points = []
         if lon and lat:
             active_points.append((lon, lat))
@@ -442,23 +429,20 @@ class EarthquakeMonitor:
             import numpy as np
             cos_lat = np.cos(np.radians((max_lat + min_lat) / 2))
 
-            # 地理的なスパンを決定 (最小 2.5度)
             span_lat = max(d_lat * 1.3, 2.5)
             span_lon = max(d_lon * 1.3, 2.5 / cos_lat)
 
-            # 中心から範囲を設定
             center_lat = (max_lat + min_lat) / 2
             center_lon = (max_lon + min_lon) / 2
 
             lim_w, lim_e = center_lon - span_lon/2, center_lon + span_lon/2
             lim_s, lim_n = center_lat - span_lat/2, center_lat + span_lat/2
 
-            # マップ領域の物理的なアスペクト比
             map_aspect = (span_lon * cos_lat) / span_lat
 
-            fig_h = 10.8  # 高さを固定
+            fig_h = 10.8
             map_w = fig_h * map_aspect
-            sidebar_w = 4.8 # サイドバー幅を固定
+            sidebar_w = 4.8
             total_w = map_w + sidebar_w
 
             fig, ax = plt.subplots(figsize=(total_w, fig_h))
@@ -466,14 +450,12 @@ class EarthquakeMonitor:
 
             relevant_gdf = gdf.cx[lim_w:lim_e, lim_s:lim_n].copy()
         else:
-            # デフォルト表示
             lim_w, lim_e = 128, 146
             lim_s, lim_n = 30, 46
             sidebar_ratio = 0.25
             fig, ax = plt.subplots(figsize=(19.2, 10.8))
             relevant_gdf = gdf.copy()
 
-        # 震度判定用のテーブルをベクトル演算で作成 (高速化)
         lookup = {str(k): v for k, v in regional_intensities.items()}
 
         code_cols = [c for c in ['code', 'CODE', 'N03_007'] if c in relevant_gdf.columns]
@@ -488,22 +470,18 @@ class EarthquakeMonitor:
 
         relevant_gdf['color'] = relevant_gdf['intensity'].map(lambda x: INTENSITY_COLORS.get(x, "#7c7c7c"))
 
-        # 背景色
         bg_color = '#001f41'
         ax.set_facecolor(bg_color)
         fig.patch.set_facecolor(bg_color)
 
-        # 描画 (地図ポリゴン)
         relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2, alpha=0.6)
 
-        # 湖沼の描画
         if self.gdf_lakes is not None:
             relevant_lakes = self.gdf_lakes.cx[lim_w:lim_e, lim_s:lim_n].copy()
             if not relevant_lakes.empty:
                 lake_color = '#003D6B'
                 relevant_lakes.plot(ax=ax, color=lake_color, edgecolor='#004A7F', linewidth=0.3, alpha=0.9, zorder=5)
 
-        # 震度アイコンの描画
         active_regions = relevant_gdf[relevant_gdf['intensity'].notna()]
         for code in INTENSITY_DISPLAY_NAMES.keys():
             subset = active_regions[active_regions['intensity'] == code]
@@ -520,7 +498,6 @@ class EarthquakeMonitor:
                 ax.text(row['rep_x'], row['rep_y'], label, color=text_color,
                         fontsize=8, ha='center', va='center', fontweight='bold', zorder=9)
 
-        # 観測点座標
         for code in INTENSITY_DISPLAY_NAMES.keys():
             pts = [st for st in station_data if st['intensity'] == code]
             if not pts: continue
@@ -536,27 +513,22 @@ class EarthquakeMonitor:
                 ax.text(p['lon'], p['lat'], label, color=text_color, fontsize=7,
                         ha='center', va='center', fontweight='bold', zorder=11)
 
-        # 震源地
         if lat and lon:
             ax.scatter(lon, lat, marker='x', color='#ffffff', s=80, linewidths=2.5, zorder=20)
             ax.scatter(lon, lat, marker='x', color='#ff3b30', s=70, linewidths=1.5, zorder=21)
 
-        # UI配置
         ax.set_position([0, 0, 1 - sidebar_ratio, 1.0])
         ax.set_xlim(lim_w, lim_e)
         ax.set_ylim(lim_s, lim_n)
 
-        # サイドバー背景
         panel_rect = mpatches.Rectangle((1 - sidebar_ratio, 0), sidebar_ratio, 1.0,
                                     transform=fig.transFigure, color='#000000', alpha=0.9, zorder=10)
         fig.patches.append(panel_rect)
 
-        # タイトル
         fig.text(0.02, 0.95, "各地の震度情報", color='#ffffff', fontsize=24, fontweight='bold', va='top', zorder=100)
         fig.text(0.02, 0.90, "Seismic Intensity Report", color='#ffffff', fontsize=12, va='top', zorder=100)
         fig.text(0.02, 0.86, announce_time, color='#ffffff', fontsize=14, va='top', zorder=100)
 
-        # 詳細パネル
         panel_x = 1 - sidebar_ratio + 0.02
         val_x = 0.98
         label_fs = 18
@@ -595,11 +567,9 @@ class EarthquakeMonitor:
             fig.text(val_x, y_pos, val_text, color='#ffffff', fontsize=val_fs_item,
                     fontweight='bold' if is_bold else 'normal', ha='right', va='top', zorder=1000)
 
-        # クレジット
         fig.text(0.012, 0.015, "気象庁防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）を加工",
                 color='#8e8e93', fontsize=6, ha='left', va='bottom', zorder=100)
 
-        # EEW表示
         if is_eew:
             eew_msg = "この地震について、緊急地震速報を発表しています。"
             ax.add_patch(mpatches.Rectangle((0.01, 0.05), 0.48, 0.06, transform=ax.transAxes,
@@ -607,7 +577,6 @@ class EarthquakeMonitor:
             ax.text(0.02, 0.08, eew_msg, transform=ax.transAxes, color='#ffff00',
                     fontsize=18, fontweight='bold', va='center', zorder=40)
 
-        # インセットマップ
         inset_w = sidebar_ratio * 0.85
         inset_h = 0.20
         inset_lx = 1.0 - sidebar_ratio + (sidebar_ratio - inset_w) / 2
@@ -670,10 +639,9 @@ def lambda_handler(event, context):
     orig_last_id = monitor.last_event_id
     orig_last_time = monitor.last_event_time
 
-    current_last_id = orig_last_id
-    current_last_time = orig_last_time
+    new_entries_to_process = []
 
-    for entry in reversed(entries[:15]):
+    for entry in entries:
         title = entry.get('title', '')
         event_id = entry.get('id', '').strip()
         event_time = entry.get('updated', '').strip()
@@ -682,27 +650,82 @@ def lambda_handler(event, context):
             continue
 
         is_already_processed = False
-        if event_id == (current_last_id or "").strip():
+        if event_id == (orig_last_id or "").strip():
             is_already_processed = True
-        elif current_last_time and event_time <= current_last_time:
+        elif orig_last_time and event_time <= orig_last_time:
             is_already_processed = True
 
         if is_already_processed:
             print(f"Skipping: {title} (Matches state. ID: {event_id})")
             continue
 
-        detail_url = entry.get('link', {}).get('@href')
-        print(f"!!! Triggering notification for: {title} ({event_id}) !!!")
+        new_entries_to_process.append(entry)
 
-        monitor.handle_detail(detail_url, event_id)
+    if not new_entries_to_process:
+        print("No new entries to process.")
+        return {"statusCode": 200, "body": "No new entries"}
 
-        current_last_id = event_id
-        current_last_time = event_time
+    # 発生時刻が古い順にソート（通知順序の保証）
+    new_entries_to_process.sort(key=lambda x: x.get('updated', ''))
 
-    if current_last_id != orig_last_id or current_last_time != orig_last_time:
-        monitor._save_state(current_last_id, current_last_time)
+    print(f"Found {len(new_entries_to_process)} new entries. Starting parallel processing...")
 
-    return {"statusCode": 200, "body": "Success"}
+    results_map = {}
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_id = {}
+        for entry in new_entries_to_process:
+            event_id = entry.get('id', '').strip()
+            detail_url = entry.get('link', {}).get('@href')
+            print(f"!!! Processing start: {entry.get('title')} ({event_id}) !!!")
+
+            future = executor.submit(monitor.handle_detail, detail_url, event_id)
+            future_to_id[future] = event_id
+
+        for future in as_completed(future_to_id):
+            eid = future_to_id[future]
+            try:
+                result = future.result()
+                results_map[eid] = result
+            except Exception as exc:
+                print(f"Event {eid} generated an exception: {exc}")
+                results_map[eid] = {"success": False, "error": str(exc)}
+
+    processed_count = 0
+    last_processed_entry = None
+
+    for entry in new_entries_to_process:
+        event_id = entry.get('id', '').strip()
+        result = results_map.get(event_id)
+
+        if result and result.get("success"):
+            print(f"Sending notification for: {event_id}")
+            payload = result["payload"]
+
+            monitor.send_to_slack(
+                payload["headline"],
+                payload["epicenter"],
+                payload["coords"],
+                payload["max_int"],
+                payload["magnitude"],
+                payload["depth"],
+                payload["time_str"],
+                payload["tsunami_text"],
+                payload["image_buf"]
+            )
+            processed_count += 1
+            last_processed_entry = entry
+        else:
+            print(f"Skipping notification for {event_id} due to processing error.")
+
+    if last_processed_entry:
+        new_last_id = last_processed_entry.get('id', '').strip()
+        new_last_time = last_processed_entry.get('updated', '').strip()
+
+        if (not orig_last_time) or (new_last_time > orig_last_time):
+            monitor._save_state(new_last_id, new_last_time)
+
+    return {"statusCode": 200, "body": f"Processed {processed_count} entries"}
 
 
 if __name__ == "__main__":
@@ -715,7 +738,6 @@ if __name__ == "__main__":
         os.environ['S3_BUCKET_NAME'] = ''
         monitor = EarthquakeMonitor()
 
-        # テスト実行もlxmlロジックで動作確認
         entries = monitor.fetch_feed()
 
         if entries:
@@ -733,8 +755,14 @@ if __name__ == "__main__":
                 target_entry = entries[0]
 
             print(f"Testing with: {target_entry.get('title')}")
-            monitor.handle_detail(target_entry.get('link', {}).get('@href'), target_entry.get('id'))
-            print("--- Local Test Finished ---")
+            result = monitor.handle_detail(target_entry.get('link', {}).get('@href'), target_entry.get('id'))
+
+            if result.get("success"):
+                p = result["payload"]
+                monitor.send_to_slack(p["headline"], p["epicenter"], p["coords"], p["max_int"], p["magnitude"], p["depth"], p["time_str"], p["tsunami_text"], p["image_buf"])
+                print("--- Local Test Finished (Success) ---")
+            else:
+                print(f"--- Local Test Finished (Failed: {result.get('error')}) ---")
     else:
         print("--- Production Mode Start (One-shot) ---")
         lambda_handler({}, None)

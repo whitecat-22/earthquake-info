@@ -214,4 +214,6 @@ lake.parquet
 unified_data_nation.parquet
 unified_data.parquet
 optimized_unified_data.parquet
+optimized_unified_data_nation.parquet
 optimized_lake.parquet
+gis/
