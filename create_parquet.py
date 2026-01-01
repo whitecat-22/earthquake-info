@@ -8,7 +8,7 @@ import shutil
 # --- 設定: 入力ファイル名 ---
 CITY_ZIP_PATH = "./gis/20241128_AreaInformationCity_quake_GIS.zip"  # 市区町村ZIP
 NATION_ZIP_PATH = "./gis/20190125_AreaForecastEEW_GIS.zip"          # 全国・地域ZIP
-LAKE_SHP_PATH = ".gis/W09-05_GML/W09-05-g_Lake.shp"                # 湖沼Shapefile
+LAKE_SHP_PATH = "./gis/W09-05_GML/W09-05-g_Lake.shp"                # 湖沼Shapefile
 
 # --- 設定: 出力ファイル名 ---
 OUTPUT_UNIFIED_PATH = "optimized_unified_data.parquet"        # 統合データ（メイン）
