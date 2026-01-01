@@ -213,3 +213,5 @@ nation.parquet
 lake.parquet
 unified_data_nation.parquet
 unified_data.parquet
+optimized_unified_data.parquet
+optimized_lake.parquet
