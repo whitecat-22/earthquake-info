@@ -16,7 +16,7 @@ from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 正規表現のコンパイルとキャッシュ（高速化のため）
+# 正規表現のコンパイルとキャッシュ
 _COORD_PATTERN_2 = re.compile(r'([+-][0-9.]+)([+-][0-9.]+)')
 _COORD_PATTERN_3 = re.compile(r'([+-][0-9.]+)([+-][0-9.]+)([+-][0-9.]+)?')
 
@@ -25,8 +25,8 @@ os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib'
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.font_manager as fm
-import matplotlib.pyplot as plt
 
+# フォント設定
 _cached_font = None
 def setup_fonts():
     global _cached_font
@@ -43,7 +43,6 @@ def setup_fonts():
     return None
 
 setup_fonts()
-
 load_dotenv()
 
 # --- 設定 ---
@@ -54,15 +53,11 @@ S3_KEY = os.getenv("S3_KEY")
 JMA_FEED_URL = os.getenv("JMA_FEED_URL")
 GEOJSON_PATH = os.getenv("GEOJSON_PATH")
 
-# --- 地図データ設定 (create_final_dataset.py の出力に対応) ---
-# メインの統合データ (City + Lake)
+# --- 地図データ設定 ---
 UNIFIED_PARQUET_PATH = 'optimized_unified_data.parquet'
-# インセットマップ用全国データ
 UNIFIED_NATION_PARQUET_PATH = 'optimized_unified_data_nation.parquet'
-
-# フォールバック用 (統合データが無い場合に参照)
 LAKE_PARQUET_PATH = 'optimized_lake.parquet'
-PARQUET_PATH = 'city.parquet' # optimized_cityは生成されないため、デフォルト名を指定
+PARQUET_PATH = 'city.parquet' # フォールバック用
 
 APP_MODE = os.getenv("APP_MODE", "production")
 
@@ -100,6 +95,290 @@ JMA_NS = {
 
 s3_client = boto3.client('s3')
 
+# --- グローバル領域でのデータロード (コールドスタート対策) ---
+GDF_JAPAN = None
+GDF_LAKES = None
+GDF_NATION = None
+
+def load_global_map_data():
+    global GDF_JAPAN, GDF_LAKES, GDF_NATION
+    print("Initializing Map Data...")
+
+    # 統合データのロード
+    if os.path.exists(UNIFIED_PARQUET_PATH):
+        print(f"Loading unified data from {UNIFIED_PARQUET_PATH}...")
+        try:
+            gdf_unified = gpd.read_parquet(UNIFIED_PARQUET_PATH)
+
+            # Cityデータ
+            GDF_JAPAN = gdf_unified[gdf_unified['data_type'] == 'city'].copy()
+            print(f"City data loaded: {len(GDF_JAPAN)} polygons")
+
+            # Lakeデータ
+            lake_data = gdf_unified[gdf_unified['data_type'] == 'lake']
+            if not lake_data.empty:
+                GDF_LAKES = lake_data.copy()
+                print(f"Lake data loaded: {len(GDF_LAKES)} lakes")
+        except Exception as e:
+            print(f"Error loading unified parquet: {e}")
+
+    # フォールバック (統合データがない場合)
+    if GDF_JAPAN is None:
+        print("Unified data not found. Loading individual files...")
+        if os.path.exists(PARQUET_PATH):
+            GDF_JAPAN = gpd.read_parquet(PARQUET_PATH)
+        elif GEOJSON_PATH and os.path.exists(GEOJSON_PATH):
+            GDF_JAPAN = gpd.read_file(GEOJSON_PATH)
+
+    if GDF_LAKES is None and os.path.exists(LAKE_PARQUET_PATH):
+        GDF_LAKES = gpd.read_parquet(LAKE_PARQUET_PATH)
+
+    # 全国データのロード (インセット用)
+    if os.path.exists(UNIFIED_NATION_PARQUET_PATH):
+        GDF_NATION = gpd.read_parquet(UNIFIED_NATION_PARQUET_PATH)
+    elif GDF_JAPAN is not None:
+        GDF_NATION = GDF_JAPAN # フォールバック
+
+    print("Map Data Initialization Completed.")
+
+# モジュール読み込み時に実行（Lambdaコールドスタート時に1回だけ走る）
+load_global_map_data()
+
+
+class MapRenderer:
+    """
+    地図描画に特化したクラス
+    グローバルにロードされた地図データを参照して描画を行う
+    """
+    def __init__(self):
+        self.gdf_japan = GDF_JAPAN
+        self.gdf_lakes = GDF_LAKES
+        self.gdf_nation = GDF_NATION
+
+    def render(self, epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude, time_str, announce_time, max_int, tsunami_text, is_eew=False):
+        if self.gdf_japan is None:
+            print("Error: Map data is not loaded.")
+            return None
+
+        gdf = self.gdf_japan
+
+        # 描画範囲の決定
+        active_points = []
+        if lon and lat:
+            active_points.append((lon, lat))
+
+        target_keys = set(str(k) for k in regional_intensities.keys())
+        # 高速化: ベクトル演算でフィルタリング
+        mask = pd.Series(False, index=gdf.index)
+        match_cols = ['code', 'CODE', 'N03_007', 'name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004']
+        for col in match_cols:
+            if col in gdf.columns:
+                mask |= gdf[col].astype(str).isin(target_keys)
+
+        active_gdf = gdf[mask]
+        if not active_gdf.empty:
+            active_points.extend(list(zip(active_gdf['rep_x'], active_gdf['rep_y'])))
+
+        fig = None
+        try:
+            if active_points:
+                lons_all, lats_all = zip(*active_points)
+                min_lon, max_lon = min(lons_all), max(lons_all)
+                min_lat, max_lat = min(lats_all), max(lats_all)
+
+                d_lat = max_lat - min_lat
+                d_lon = max_lon - min_lon
+
+                import numpy as np
+                cos_lat = np.cos(np.radians((max_lat + min_lat) / 2))
+
+                # マージン設定
+                span_lat = max(d_lat * 1.3, 2.5)
+                span_lon = max(d_lon * 1.3, 2.5 / cos_lat)
+
+                center_lat = (max_lat + min_lat) / 2
+                center_lon = (max_lon + min_lon) / 2
+
+                lim_w, lim_e = center_lon - span_lon/2, center_lon + span_lon/2
+                lim_s, lim_n = center_lat - span_lat/2, center_lat + span_lat/2
+
+                map_aspect = (span_lon * cos_lat) / span_lat
+
+                fig_h = 10.8
+                map_w = fig_h * map_aspect
+                sidebar_w = 4.8
+                total_w = map_w + sidebar_w
+
+                fig, ax = plt.subplots(figsize=(total_w, fig_h))
+                sidebar_ratio = sidebar_w / total_w
+
+                relevant_gdf = gdf.cx[lim_w:lim_e, lim_s:lim_n].copy()
+            else:
+                # デフォルト表示
+                lim_w, lim_e = 128, 146
+                lim_s, lim_n = 30, 46
+                sidebar_ratio = 0.25
+                fig, ax = plt.subplots(figsize=(19.2, 10.8))
+                relevant_gdf = gdf.copy()
+
+            # 震度データのマッピング
+            lookup = {str(k): v for k, v in regional_intensities.items()}
+            code_cols = [c for c in ['code', 'CODE', 'N03_007'] if c in relevant_gdf.columns]
+            name_cols = [c for c in ['name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004'] if c in relevant_gdf.columns]
+            search_cols = code_cols + name_cols
+
+            relevant_gdf['intensity'] = None
+            for col in search_cols:
+                relevant_gdf['intensity'] = relevant_gdf['intensity'].fillna(
+                    relevant_gdf[col].astype(str).map(lookup)
+                )
+
+            relevant_gdf['color'] = relevant_gdf['intensity'].map(lambda x: INTENSITY_COLORS.get(x, "#7c7c7c"))
+
+            # 背景と陸地
+            bg_color = '#001f41'
+            ax.set_facecolor(bg_color)
+            fig.patch.set_facecolor(bg_color)
+            relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2, alpha=0.6)
+
+            # 湖沼の描画
+            if self.gdf_lakes is not None:
+                relevant_lakes = self.gdf_lakes.cx[lim_w:lim_e, lim_s:lim_n].copy()
+                if not relevant_lakes.empty:
+                    lake_color = '#003D6B'
+                    relevant_lakes.plot(ax=ax, color=lake_color, edgecolor='#004A7F', linewidth=0.3, alpha=0.9, zorder=5)
+
+            # 震度アイコン (市区町村)
+            active_regions = relevant_gdf[relevant_gdf['intensity'].notna()]
+            for code in INTENSITY_DISPLAY_NAMES.keys():
+                subset = active_regions[active_regions['intensity'] == code]
+                if subset.empty: continue
+
+                color = INTENSITY_COLORS.get(code, "#ffffff")
+                label = INTENSITY_LABELS.get(code, code)
+                text_color = '#000000' if code in ["1","2","4","5-","5+"] else '#ffffff'
+
+                ax.scatter(subset['rep_x'], subset['rep_y'], marker='s', s=144, color=color,
+                        edgecolors='#000000', linewidths=0.5, zorder=8)
+
+                for _, row in subset.iterrows():
+                    ax.text(row['rep_x'], row['rep_y'], label, color=text_color,
+                            fontsize=8, ha='center', va='center', fontweight='bold', zorder=9)
+
+            # 震度アイコン (観測点)
+            for code in INTENSITY_DISPLAY_NAMES.keys():
+                pts = [st for st in station_data if st['intensity'] == code]
+                if not pts: continue
+
+                color = INTENSITY_COLORS.get(code, "#ffffff")
+                label = INTENSITY_LABELS.get(code, code)
+                text_color = '#000000' if code in ["1","2","4","5-","5+"] else '#ffffff'
+
+                lons = [p['lon'] for p in pts]
+                lats = [p['lat'] for p in pts]
+                ax.scatter(lons, lats, marker='o', s=100, color=color, edgecolors='#ffffff', linewidths=0.8, zorder=10)
+                for p in pts:
+                    ax.text(p['lon'], p['lat'], label, color=text_color, fontsize=7,
+                            ha='center', va='center', fontweight='bold', zorder=11)
+
+            # 震源地
+            if lat and lon:
+                ax.scatter(lon, lat, marker='x', color='#ffffff', s=80, linewidths=2.5, zorder=20)
+                ax.scatter(lon, lat, marker='x', color='#ff3b30', s=70, linewidths=1.5, zorder=21)
+
+            # レイアウト調整
+            ax.set_position([0, 0, 1 - sidebar_ratio, 1.0])
+            ax.set_xlim(lim_w, lim_e)
+            ax.set_ylim(lim_s, lim_n)
+            ax.set_axis_off()
+
+            # サイドバー
+            panel_rect = mpatches.Rectangle((1 - sidebar_ratio, 0), sidebar_ratio, 1.0,
+                                        transform=fig.transFigure, color='#000000', alpha=0.9, zorder=10)
+            fig.patches.append(panel_rect)
+
+            # テキスト情報
+            fig.text(0.02, 0.95, "各地の震度情報", color='#ffffff', fontsize=24, fontweight='bold', va='top', zorder=100)
+            fig.text(0.02, 0.90, "Seismic Intensity Report", color='#ffffff', fontsize=12, va='top', zorder=100)
+            fig.text(0.02, 0.86, announce_time, color='#ffffff', fontsize=14, va='top', zorder=100)
+
+            panel_x = 1 - sidebar_ratio + 0.02
+            val_x = 0.98
+            label_fs = 18
+            sub_label_fs = 12
+            value_fs = 34
+
+            try:
+                dt_obj = datetime.datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
+                d_str = dt_obj.strftime('%m月%d日')
+                t_str = dt_obj.strftime('%H:%M頃')
+            except:
+                d_str = time_str
+                t_str = ""
+
+            tsunami_display = tsunami_text
+            if any(x in tsunami_text for x in ["被害の心配はありません", "津波の心配はありません"]):
+                tsunami_display = "被害の心配なし"
+            elif any(x in tsunami_text for x in ["詳細はありません", "失敗しました"]):
+                tsunami_display = "調査中"
+            elif "津波注意報" in tsunami_text:
+                tsunami_display = "津波注意報"
+            wrapped_tsunami = textwrap.fill(tsunami_display, width=16)
+
+            ui_items = [
+                ("最大震度", "Max Intensity", INTENSITY_DISPLAY_NAMES.get(max_int, max_int), 0.95, value_fs, True),
+                ("規模", "Magnitude", f"{magnitude}", 0.86, value_fs, True),
+                ("発生時刻", "Date", f"{d_str}\n{t_str}", 0.77, 18, True),
+                ("震源地", "Epicenter", epicenter_name, 0.67, 17, False),
+                ("深さ", "Depth", depth, 0.57, 18, False),
+                ("津波", "Tsunami", wrapped_tsunami, 0.47, 15, False)
+            ]
+
+            for label_jp, label_en, val_text, y_pos, val_fs_item, is_bold in ui_items:
+                fig.text(panel_x, y_pos, label_jp, color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
+                fig.text(panel_x, y_pos - 0.025, label_en, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
+                fig.text(val_x, y_pos, val_text, color='#ffffff', fontsize=val_fs_item,
+                        fontweight='bold' if is_bold else 'normal', ha='right', va='top', zorder=1000)
+
+            fig.text(0.012, 0.015, "気象庁防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）を加工",
+                    color='#8e8e93', fontsize=6, ha='left', va='bottom', zorder=100)
+
+            if is_eew:
+                eew_msg = "この地震について、緊急地震速報を発表しています。"
+                ax.add_patch(mpatches.Rectangle((0.01, 0.05), 0.48, 0.06, transform=ax.transAxes,
+                                            color='#000000', alpha=0.7, zorder=35))
+                ax.text(0.02, 0.08, eew_msg, transform=ax.transAxes, color='#ffff00',
+                        fontsize=18, fontweight='bold', va='center', zorder=40)
+
+            # インセットマップ
+            if self.gdf_nation is not None:
+                inset_w = sidebar_ratio * 0.85
+                inset_h = 0.20
+                inset_lx = 1.0 - sidebar_ratio + (sidebar_ratio - inset_w) / 2
+                inset_pos = [inset_lx, 0.04, inset_w, inset_h]
+                inset_ax = fig.add_axes(inset_pos, zorder=50)
+
+                self.gdf_nation.plot(ax=inset_ax, color='#ffffff', edgecolor='#2c2c2e', linewidth=0.1, alpha=0.8)
+
+                overview_rect = mpatches.Rectangle((lim_w, lim_s), lim_e - lim_w, lim_n - lim_s,
+                                                edgecolor='#ff3b30', facecolor='none', linewidth=1.5, zorder=40)
+                inset_ax.add_patch(overview_rect)
+                inset_ax.set_xlim(122, 149)
+                inset_ax.set_ylim(24, 46)
+                inset_ax.set_axis_off()
+                inset_ax.set_facecolor('none')
+
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=144, facecolor=fig.get_facecolor())
+            buf.seek(0)
+            return buf
+
+        finally:
+            if fig:
+                plt.close(fig)
+                fig.clf()
+
+
 class EarthquakeMonitor:
     def __init__(self):
         state = self._load_state()
@@ -107,10 +386,11 @@ class EarthquakeMonitor:
         self.last_event_time = state.get('event_time') or state.get('updated')
         self.slack_client = WebClient(token=SLACK_BOT_TOKEN)
         self.session = requests.Session()
+
+        # 描画クラスを初期化
+        self.renderer = MapRenderer()
+
         print(f"Loaded state from S3: ID={self.last_event_id}, Time={self.last_event_time}")
-        self.gdf_japan = None
-        self.gdf_nation = None
-        self.gdf_lakes = None
 
     def _load_state(self):
         if not S3_BUCKET:
@@ -232,12 +512,10 @@ class EarthquakeMonitor:
                 epicenter_name = '不明'
                 coord_str = ''
 
+            # 津波情報取得 (jmx_ib優先)
             tsunami_text = x_text(body, './/jmx_ib:Comments/jmx_ib:ForecastComment/jmx_ib:Text')
-
-            # 見つからない場合は jmx (ルート名前空間) でフォールバック
             if not tsunami_text:
                 tsunami_text = x_text(body, './/jmx:Comments/jmx:ForecastComment/jmx:Text')
-
             if not tsunami_text:
                 tsunami_text = "津波情報の詳細はありません。"
 
@@ -323,50 +601,10 @@ class EarthquakeMonitor:
                         current_max_val = order[v]
                         max_intensity = v
 
-            # 地図データのロード
-            # create_final_dataset.py で生成された optimized_unified_data.parquet を優先的に使用
-            if self.gdf_japan is None or self.gdf_lakes is None:
-                if os.path.exists(UNIFIED_PARQUET_PATH):
-                    print(f"Loading unified data from {UNIFIED_PARQUET_PATH}...")
-                    gdf_unified = gpd.read_parquet(UNIFIED_PARQUET_PATH)
-
-                    # data_type カラムで分割
-                    if self.gdf_japan is None:
-                        self.gdf_japan = gdf_unified[gdf_unified['data_type'] == 'city'].copy()
-                        # 不要なカラムは落とさない（ベクトル演算で使う可能性があるため）
-                        print(f"City data loaded: {len(self.gdf_japan)} polygons")
-
-                    if self.gdf_lakes is None:
-                        lake_data = gdf_unified[gdf_unified['data_type'] == 'lake']
-                        if not lake_data.empty:
-                            self.gdf_lakes = lake_data.copy()
-                            print(f"Lake data loaded: {len(self.gdf_lakes)} lakes")
-                        else:
-                            self.gdf_lakes = None
-                    print("Unified data loaded successfully.")
-                else:
-                    print("Unified data not found. Loading individual files...")
-                    if self.gdf_japan is None:
-                        if os.path.exists(PARQUET_PATH):
-                            self.gdf_japan = gpd.read_parquet(PARQUET_PATH)
-                        elif GEOJSON_PATH and os.path.exists(GEOJSON_PATH):
-                            self.gdf_japan = gpd.read_file(GEOJSON_PATH)
-
-                    if self.gdf_lakes is None:
-                        if os.path.exists(LAKE_PARQUET_PATH):
-                            self.gdf_lakes = gpd.read_parquet(LAKE_PARQUET_PATH)
-                        else:
-                            self.gdf_lakes = None
-
-            if self.gdf_nation is None:
-                if os.path.exists(UNIFIED_NATION_PARQUET_PATH):
-                    self.gdf_nation = gpd.read_parquet(UNIFIED_NATION_PARQUET_PATH)
-                else:
-                    self.gdf_nation = self.gdf_japan
-
             is_eew = "緊急地震速報を発表しています" in headline_text or "緊急地震速報を発表しています" in tsunami_text
 
-            image_buf = self.generate_map(
+            # 地図生成はRendererに委譲
+            image_buf = self.renderer.render(
                 epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude,
                 map_time_str, announcement_time, max_intensity, tsunami_text, is_eew
             )
@@ -399,206 +637,6 @@ class EarthquakeMonitor:
             import traceback
             traceback.print_exc()
             return {"success": False, "event_id": event_id, "error": str(e)}
-
-    def generate_map(self, epicenter_name, lat, lon, depth, regional_intensities, station_data, magnitude, time_str, announce_time, max_int, tsunami_text, is_eew=False):
-        gdf = self.gdf_japan
-
-        active_points = []
-        if lon and lat:
-            active_points.append((lon, lat))
-
-        target_keys = set(str(k) for k in regional_intensities.keys())
-        mask = pd.Series(False, index=gdf.index)
-        match_cols = ['code', 'CODE', 'N03_007', 'name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004']
-        for col in match_cols:
-            if col in gdf.columns:
-                mask |= gdf[col].astype(str).isin(target_keys)
-
-        active_gdf = gdf[mask]
-        if not active_gdf.empty:
-            active_points.extend(list(zip(active_gdf['rep_x'], active_gdf['rep_y'])))
-
-        if active_points:
-            lons_all, lats_all = zip(*active_points)
-            min_lon, max_lon = min(lons_all), max(lons_all)
-            min_lat, max_lat = min(lats_all), max(lats_all)
-
-            d_lat = max_lat - min_lat
-            d_lon = max_lon - min_lon
-
-            import numpy as np
-            cos_lat = np.cos(np.radians((max_lat + min_lat) / 2))
-
-            span_lat = max(d_lat * 1.3, 2.5)
-            span_lon = max(d_lon * 1.3, 2.5 / cos_lat)
-
-            center_lat = (max_lat + min_lat) / 2
-            center_lon = (max_lon + min_lon) / 2
-
-            lim_w, lim_e = center_lon - span_lon/2, center_lon + span_lon/2
-            lim_s, lim_n = center_lat - span_lat/2, center_lat + span_lat/2
-
-            map_aspect = (span_lon * cos_lat) / span_lat
-
-            fig_h = 10.8
-            map_w = fig_h * map_aspect
-            sidebar_w = 4.8
-            total_w = map_w + sidebar_w
-
-            fig, ax = plt.subplots(figsize=(total_w, fig_h))
-            sidebar_ratio = sidebar_w / total_w
-
-            relevant_gdf = gdf.cx[lim_w:lim_e, lim_s:lim_n].copy()
-        else:
-            lim_w, lim_e = 128, 146
-            lim_s, lim_n = 30, 46
-            sidebar_ratio = 0.25
-            fig, ax = plt.subplots(figsize=(19.2, 10.8))
-            relevant_gdf = gdf.copy()
-
-        lookup = {str(k): v for k, v in regional_intensities.items()}
-
-        code_cols = [c for c in ['code', 'CODE', 'N03_007'] if c in relevant_gdf.columns]
-        name_cols = [c for c in ['name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004'] if c in relevant_gdf.columns]
-        search_cols = code_cols + name_cols
-
-        relevant_gdf['intensity'] = None
-        for col in search_cols:
-            relevant_gdf['intensity'] = relevant_gdf['intensity'].fillna(
-                relevant_gdf[col].astype(str).map(lookup)
-            )
-
-        relevant_gdf['color'] = relevant_gdf['intensity'].map(lambda x: INTENSITY_COLORS.get(x, "#7c7c7c"))
-
-        bg_color = '#001f41'
-        ax.set_facecolor(bg_color)
-        fig.patch.set_facecolor(bg_color)
-
-        relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2, alpha=0.6)
-
-        if self.gdf_lakes is not None:
-            relevant_lakes = self.gdf_lakes.cx[lim_w:lim_e, lim_s:lim_n].copy()
-            if not relevant_lakes.empty:
-                lake_color = '#003D6B'
-                relevant_lakes.plot(ax=ax, color=lake_color, edgecolor='#004A7F', linewidth=0.3, alpha=0.9, zorder=5)
-
-        active_regions = relevant_gdf[relevant_gdf['intensity'].notna()]
-        for code in INTENSITY_DISPLAY_NAMES.keys():
-            subset = active_regions[active_regions['intensity'] == code]
-            if subset.empty: continue
-
-            color = INTENSITY_COLORS.get(code, "#ffffff")
-            label = INTENSITY_LABELS.get(code, code)
-            text_color = '#000000' if code in ["1","2","4","5-","5+"] else '#ffffff'
-
-            ax.scatter(subset['rep_x'], subset['rep_y'], marker='s', s=144, color=color,
-                    edgecolors='#000000', linewidths=0.5, zorder=8)
-
-            for _, row in subset.iterrows():
-                ax.text(row['rep_x'], row['rep_y'], label, color=text_color,
-                        fontsize=8, ha='center', va='center', fontweight='bold', zorder=9)
-
-        for code in INTENSITY_DISPLAY_NAMES.keys():
-            pts = [st for st in station_data if st['intensity'] == code]
-            if not pts: continue
-
-            color = INTENSITY_COLORS.get(code, "#ffffff")
-            label = INTENSITY_LABELS.get(code, code)
-            text_color = '#000000' if code in ["1","2","4","5-","5+"] else '#ffffff'
-
-            lons = [p['lon'] for p in pts]
-            lats = [p['lat'] for p in pts]
-            ax.scatter(lons, lats, marker='o', s=100, color=color, edgecolors='#ffffff', linewidths=0.8, zorder=10)
-            for p in pts:
-                ax.text(p['lon'], p['lat'], label, color=text_color, fontsize=7,
-                        ha='center', va='center', fontweight='bold', zorder=11)
-
-        if lat and lon:
-            ax.scatter(lon, lat, marker='x', color='#ffffff', s=80, linewidths=2.5, zorder=20)
-            ax.scatter(lon, lat, marker='x', color='#ff3b30', s=70, linewidths=1.5, zorder=21)
-
-        ax.set_position([0, 0, 1 - sidebar_ratio, 1.0])
-        ax.set_xlim(lim_w, lim_e)
-        ax.set_ylim(lim_s, lim_n)
-
-        panel_rect = mpatches.Rectangle((1 - sidebar_ratio, 0), sidebar_ratio, 1.0,
-                                    transform=fig.transFigure, color='#000000', alpha=0.9, zorder=10)
-        fig.patches.append(panel_rect)
-
-        fig.text(0.02, 0.95, "各地の震度情報", color='#ffffff', fontsize=24, fontweight='bold', va='top', zorder=100)
-        fig.text(0.02, 0.90, "Seismic Intensity Report", color='#ffffff', fontsize=12, va='top', zorder=100)
-        fig.text(0.02, 0.86, announce_time, color='#ffffff', fontsize=14, va='top', zorder=100)
-
-        panel_x = 1 - sidebar_ratio + 0.02
-        val_x = 0.98
-        label_fs = 18
-        sub_label_fs = 12
-        value_fs = 34
-
-        try:
-            dt_obj = datetime.datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-            d_str = dt_obj.strftime('%m月%d日')
-            t_str = dt_obj.strftime('%H:%M頃')
-        except:
-            d_str = time_str
-            t_str = ""
-
-        tsunami_display = tsunami_text
-        if any(x in tsunami_text for x in ["被害の心配はありません", "津波の心配はありません"]):
-            tsunami_display = "被害の心配なし"
-        elif any(x in tsunami_text for x in ["詳細はありません", "失敗しました"]):
-            tsunami_display = "調査中"
-        elif "津波注意報" in tsunami_text:
-            tsunami_display = "津波注意報"
-        wrapped_tsunami = textwrap.fill(tsunami_display, width=16)
-
-        ui_items = [
-            ("最大震度", "Max Intensity", INTENSITY_DISPLAY_NAMES.get(max_int, max_int), 0.95, value_fs, True),
-            ("規模", "Magnitude", f"{magnitude}", 0.86, value_fs, True),
-            ("発生時刻", "Date", f"{d_str}\n{t_str}", 0.77, 18, True),
-            ("震源地", "Epicenter", epicenter_name, 0.67, 17, False),
-            ("深さ", "Depth", depth, 0.57, 18, False),
-            ("津波", "Tsunami", wrapped_tsunami, 0.47, 15, False)
-        ]
-
-        for label_jp, label_en, val_text, y_pos, val_fs_item, is_bold in ui_items:
-            fig.text(panel_x, y_pos, label_jp, color='#ffffff', fontsize=label_fs, va='top', zorder=1000)
-            fig.text(panel_x, y_pos - 0.025, label_en, color='#ffffff', fontsize=sub_label_fs, va='top', zorder=1000)
-            fig.text(val_x, y_pos, val_text, color='#ffffff', fontsize=val_fs_item,
-                    fontweight='bold' if is_bold else 'normal', ha='right', va='top', zorder=1000)
-
-        fig.text(0.012, 0.015, "気象庁防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）を加工",
-                color='#8e8e93', fontsize=6, ha='left', va='bottom', zorder=100)
-
-        if is_eew:
-            eew_msg = "この地震について、緊急地震速報を発表しています。"
-            ax.add_patch(mpatches.Rectangle((0.01, 0.05), 0.48, 0.06, transform=ax.transAxes,
-                                        color='#000000', alpha=0.7, zorder=35))
-            ax.text(0.02, 0.08, eew_msg, transform=ax.transAxes, color='#ffff00',
-                    fontsize=18, fontweight='bold', va='center', zorder=40)
-
-        inset_w = sidebar_ratio * 0.85
-        inset_h = 0.20
-        inset_lx = 1.0 - sidebar_ratio + (sidebar_ratio - inset_w) / 2
-        inset_pos = [inset_lx, 0.04, inset_w, inset_h]
-        inset_ax = fig.add_axes(inset_pos, zorder=50)
-
-        self.gdf_nation.plot(ax=inset_ax, color='#ffffff', edgecolor='#2c2c2e', linewidth=0.1, alpha=0.8)
-
-        overview_rect = mpatches.Rectangle((lim_w, lim_s), lim_e - lim_w, lim_n - lim_s,
-                                        edgecolor='#ff3b30', facecolor='none', linewidth=1.5, zorder=40)
-        inset_ax.add_patch(overview_rect)
-        inset_ax.set_xlim(122, 149)
-        inset_ax.set_ylim(24, 46)
-        inset_ax.set_axis_off()
-        inset_ax.set_facecolor('none')
-        ax.set_axis_off()
-
-        buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=144, facecolor=fig.get_facecolor())
-        buf.seek(0)
-        plt.close(fig)
-        return buf
 
     def send_to_slack(self, headline, epicenter, coords, max_int, magnitude, depth, time_str, tsunami_text, image_buf):
         if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
