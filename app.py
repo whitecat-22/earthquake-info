@@ -15,6 +15,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
 
 # 正規表現のコンパイルとキャッシュ
 _COORD_PATTERN_2 = re.compile(r'([+-][0-9.]+)([+-][0-9.]+)')
@@ -340,7 +341,7 @@ class MapRenderer:
                 fig.text(val_x, y_pos, val_text, color='#ffffff', fontsize=val_fs_item,
                         fontweight='bold' if is_bold else 'normal', ha='right', va='top', zorder=1000)
 
-            fig.text(0.012, 0.015, "気象庁防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）を加工",
+            fig.text(0.012, 0.015, "気象庁防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）、国土数値情報（湖沼）を加工",
                     color='#8e8e93', fontsize=6, ha='left', va='bottom', zorder=100)
 
             if is_eew:
@@ -375,8 +376,10 @@ class MapRenderer:
 
         finally:
             if fig:
-                plt.close(fig)
                 fig.clf()
+                plt.close(fig)
+            plt.close('all') # 念のため全てのplotを閉じる
+            gc.collect()     # ガベージコレクションを促進
 
 
 class EarthquakeMonitor:
@@ -644,7 +647,7 @@ class EarthquakeMonitor:
             return
 
         try:
-            credit_link = "<https://www.jma.go.jp/jma/index.html|気象庁>防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）を加工"
+            credit_link = "<https://www.jma.go.jp/jma/index.html|気象庁>防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）、国土数値情報（湖沼）を加工"
 
             message = (
                 f"<!here> *【地震速報】*\n{headline}\n\n"
