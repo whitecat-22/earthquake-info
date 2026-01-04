@@ -300,8 +300,8 @@ class MapRenderer:
 
             # テキスト情報
             fig.text(0.02, 0.95, "各地の震度情報", color='#ffffff', fontsize=24, fontweight='bold', va='top', zorder=100)
-            fig.text(0.02, 0.90, "Seismic Intensity Report", color='#ffffff', fontsize=12, va='top', zorder=100)
-            fig.text(0.02, 0.86, announce_time, color='#ffffff', fontsize=14, va='top', zorder=100)
+            fig.text(0.02, 0.915, "Seismic Intensity Report", color='#ffffff', fontsize=12, va='top', zorder=100)
+            fig.text(0.02, 0.89, announce_time, color='#ffffff', fontsize=14, va='top', zorder=100)
 
             panel_x = 1 - sidebar_ratio + 0.02
             val_x = 0.98
