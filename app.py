@@ -627,6 +627,7 @@ class EarthquakeMonitor:
                     "epicenter": epicenter_name,
                     "coords": coords_str,
                     "max_int": max_int_label,
+                    "max_int_raw": max_intensity,
                     "magnitude": magnitude,
                     "depth": depth,
                     "time_str": formatted_time,
@@ -641,16 +642,35 @@ class EarthquakeMonitor:
             traceback.print_exc()
             return {"success": False, "event_id": event_id, "error": str(e)}
 
-    def send_to_slack(self, headline, epicenter, coords, max_int, magnitude, depth, time_str, tsunami_text, image_buf):
+    def send_to_slack(self, headline, epicenter, coords, max_int, magnitude, depth, time_str, tsunami_text, image_buf, max_int_raw="0"):
         if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
             print("Slack setting missing.")
             return
 
         try:
+            # 絵文字の判定
+            emoji = ""
+            # 震度を数値スコアに変換して比較しやすくする
+            intensity_order = {
+                "0": 0, "1": 10, "2": 20, "3": 30, "4": 40,
+                "5-": 50, "5+": 55, "6-": 60, "6+": 65, "7": 70
+            }
+            score = intensity_order.get(str(max_int_raw), 0)
+
+            # 条件1: 赤色相当 (:rotating_light:)
+            # 津波警報(大津波警報含む) または 震度5弱(50)以上
+            if "警報" in tsunami_text or score >= 50:
+                emoji = " :rotating_light:"
+
+            # 条件2: 黄色相当 (:warning:)
+            # 津波注意報 または 津波情報が不明 または 震度4(40)以上
+            elif "注意報" in tsunami_text or "不明" in tsunami_text or score >= 40:
+                emoji = " :warning:"
+
             credit_link = "<https://www.jma.go.jp/jma/index.html|気象庁>防災情報XMLフォーマットを加工して作成 | 『気象庁防災情報発表区域データセット』（NII作成） 「GISデータ」（気象庁）、国土数値情報（湖沼）を加工"
 
             message = (
-                f"<!here> *【地震速報】*\n{headline}\n\n"
+                f"<!here> *【地震速報】{emoji}*\n{headline}\n\n"
                 f"*発生時刻*: {time_str}\n"
                 f"*震央地名*: {epicenter}\n"
                 f"*緯度経度*: {coords}\n"
@@ -752,7 +772,8 @@ def lambda_handler(event, context):
                 payload["depth"],
                 payload["time_str"],
                 payload["tsunami_text"],
-                payload["image_buf"]
+                payload["image_buf"],
+                payload.get("max_int_raw", "0")
             )
             processed_count += 1
             last_processed_entry = entry
@@ -800,7 +821,11 @@ if __name__ == "__main__":
 
             if result.get("success"):
                 p = result["payload"]
-                monitor.send_to_slack(p["headline"], p["epicenter"], p["coords"], p["max_int"], p["magnitude"], p["depth"], p["time_str"], p["tsunami_text"], p["image_buf"])
+                monitor.send_to_slack(
+                    p["headline"], p["epicenter"], p["coords"], p["max_int"],
+                    p["magnitude"], p["depth"], p["time_str"], p["tsunami_text"],
+                    p["image_buf"], p.get("max_int_raw", "0")
+                )
                 print("--- Local Test Finished (Success) ---")
             else:
                 print(f"--- Local Test Finished (Failed: {result.get('error')}) ---")
