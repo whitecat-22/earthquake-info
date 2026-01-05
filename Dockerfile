@@ -24,6 +24,7 @@ COPY app.py .
 COPY optimized_unified_data.parquet .
 COPY optimized_unified_data_nation.parquet .
 COPY optimized_lake.parquet .
+COPY stations.parquet .
 
 # 4. Lambdaハンドラの設定
 CMD ["app.lambda_handler"]

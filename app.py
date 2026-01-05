@@ -52,13 +52,12 @@ SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 S3_KEY = os.getenv("S3_KEY")
 JMA_FEED_URL = os.getenv("JMA_FEED_URL")
-GEOJSON_PATH = os.getenv("GEOJSON_PATH")
+STATIONS_PARQUET_PATH = os.getenv("STATIONS_PARQUET_PATH")
 
 # --- 地図データ設定 ---
-UNIFIED_PARQUET_PATH = 'optimized_unified_data.parquet'
-UNIFIED_NATION_PARQUET_PATH = 'optimized_unified_data_nation.parquet'
-LAKE_PARQUET_PATH = 'optimized_lake.parquet'
-PARQUET_PATH = 'city.parquet' # フォールバック用
+UNIFIED_PARQUET_PATH = os.getenv("UNIFIED_PARQUET_PATH")
+UNIFIED_NATION_PARQUET_PATH = os.getenv("UNIFIED_NATION_PARQUET_PATH")
+LAKE_PARQUET_PATH = os.getenv("LAKE_PARQUET_PATH")
 
 APP_MODE = os.getenv("APP_MODE", "production")
 
@@ -96,13 +95,14 @@ JMA_NS = {
 
 s3_client = boto3.client('s3')
 
-# --- グローバル領域でのデータロード (コールドスタート対策) ---
+# --- グローバル領域でのデータロード ---
 GDF_JAPAN = None
 GDF_LAKES = None
 GDF_NATION = None
+STATIONS_DB = {} # 観測点情報の辞書
 
 def load_global_map_data():
-    global GDF_JAPAN, GDF_LAKES, GDF_NATION
+    global GDF_JAPAN, GDF_LAKES, GDF_NATION, STATIONS_DB
     print("Initializing Map Data...")
 
     # 統合データのロード
@@ -110,46 +110,46 @@ def load_global_map_data():
         print(f"Loading unified data from {UNIFIED_PARQUET_PATH}...")
         try:
             gdf_unified = gpd.read_parquet(UNIFIED_PARQUET_PATH)
-
-            # Cityデータ
             GDF_JAPAN = gdf_unified[gdf_unified['data_type'] == 'city'].copy()
             print(f"City data loaded: {len(GDF_JAPAN)} polygons")
-
-            # Lakeデータ
             lake_data = gdf_unified[gdf_unified['data_type'] == 'lake']
             if not lake_data.empty:
                 GDF_LAKES = lake_data.copy()
-                print(f"Lake data loaded: {len(GDF_LAKES)} lakes")
         except Exception as e:
             print(f"Error loading unified parquet: {e}")
-
-    # フォールバック (統合データがない場合)
-    if GDF_JAPAN is None:
-        print("Unified data not found. Loading individual files...")
-        if os.path.exists(PARQUET_PATH):
-            GDF_JAPAN = gpd.read_parquet(PARQUET_PATH)
-        elif GEOJSON_PATH and os.path.exists(GEOJSON_PATH):
-            GDF_JAPAN = gpd.read_file(GEOJSON_PATH)
 
     if GDF_LAKES is None and os.path.exists(LAKE_PARQUET_PATH):
         GDF_LAKES = gpd.read_parquet(LAKE_PARQUET_PATH)
 
-    # 全国データのロード (インセット用)
     if os.path.exists(UNIFIED_NATION_PARQUET_PATH):
         GDF_NATION = gpd.read_parquet(UNIFIED_NATION_PARQUET_PATH)
     elif GDF_JAPAN is not None:
-        GDF_NATION = GDF_JAPAN # フォールバック
+        GDF_NATION = GDF_JAPAN
+
+    # 観測点データのロード
+    if os.path.exists(STATIONS_PARQUET_PATH):
+        print(f"Loading stations from {STATIONS_PARQUET_PATH}...")
+        try:
+            # ParquetをDataFrameとして読み込み
+            df_stations = pd.read_parquet(STATIONS_PARQUET_PATH)
+
+            STATIONS_DB = df_stations.set_index('code')[['lat', 'lon', 'name']].to_dict(orient='index')
+
+            print(f"Stations loaded: {len(STATIONS_DB)} points")
+        except Exception as e:
+            print(f"Error loading stations parquet: {e}")
+    else:
+        print(f"Warning: {STATIONS_PARQUET_PATH} not found.")
 
     print("Map Data Initialization Completed.")
 
-# モジュール読み込み時に実行（Lambdaコールドスタート時に1回だけ走る）
+# モジュール読み込み時に実行
 load_global_map_data()
 
 
 class MapRenderer:
     """
     地図描画に特化したクラス
-    グローバルにロードされた地図データを参照して描画を行う
     """
     def __init__(self):
         self.gdf_japan = GDF_JAPAN
@@ -168,8 +168,8 @@ class MapRenderer:
         if lon and lat:
             active_points.append((lon, lat))
 
+        # ポリゴンの描画用に震度のある地域を抽出
         target_keys = set(str(k) for k in regional_intensities.keys())
-        # 高速化: ベクトル演算でフィルタリング
         mask = pd.Series(False, index=gdf.index)
         match_cols = ['code', 'CODE', 'N03_007', 'name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004']
         for col in match_cols:
@@ -177,8 +177,15 @@ class MapRenderer:
                 mask |= gdf[col].astype(str).isin(target_keys)
 
         active_gdf = gdf[mask]
+
+        # 描画範囲計算には「震度のあるポリゴンの重心」も含める
         if not active_gdf.empty:
             active_points.extend(list(zip(active_gdf['rep_x'], active_gdf['rep_y'])))
+
+        # 「観測点」の座標も含める（観測点が広範囲にある場合に対応）
+        if station_data:
+            for s in station_data:
+                active_points.append((s['lon'], s['lat']))
 
         fig = None
         try:
@@ -194,8 +201,8 @@ class MapRenderer:
                 cos_lat = np.cos(np.radians((max_lat + min_lat) / 2))
 
                 # マージン設定
-                span_lat = max(d_lat * 1.3, 2.5)
-                span_lon = max(d_lon * 1.3, 2.5 / cos_lat)
+                span_lat = max(d_lat * 1.4, 2.5)
+                span_lon = max(d_lon * 1.4, 2.5 / cos_lat)
 
                 center_lat = (max_lat + min_lat) / 2
                 center_lon = (max_lon + min_lon) / 2
@@ -222,7 +229,7 @@ class MapRenderer:
                 fig, ax = plt.subplots(figsize=(19.2, 10.8))
                 relevant_gdf = gdf.copy()
 
-            # 震度データのマッピング
+            # 震度データのマッピング（市区町村ごとの最大震度で塗る）
             lookup = {str(k): v for k, v in regional_intensities.items()}
             code_cols = [c for c in ['code', 'CODE', 'N03_007'] if c in relevant_gdf.columns]
             name_cols = [c for c in ['name', 'nam', 'name_ja', 'COMMNAME', 'CITYNAME', 'N03_004'] if c in relevant_gdf.columns]
@@ -234,12 +241,15 @@ class MapRenderer:
                     relevant_gdf[col].astype(str).map(lookup)
                 )
 
+            # 震度に応じた色、なければグレー
             relevant_gdf['color'] = relevant_gdf['intensity'].map(lambda x: INTENSITY_COLORS.get(x, "#7c7c7c"))
 
             # 背景と陸地
             bg_color = '#001f41'
             ax.set_facecolor(bg_color)
             fig.patch.set_facecolor(bg_color)
+
+            # ポリゴン描画
             relevant_gdf.plot(ax=ax, color=relevant_gdf['color'], edgecolor='#2c2c2e', linewidth=0.2, alpha=0.6)
 
             # 湖沼の描画
@@ -249,25 +259,9 @@ class MapRenderer:
                     lake_color = '#003D6B'
                     relevant_lakes.plot(ax=ax, color=lake_color, edgecolor='#004A7F', linewidth=0.3, alpha=0.9, zorder=5)
 
-            # 震度アイコン (市区町村)
-            active_regions = relevant_gdf[relevant_gdf['intensity'].notna()]
+            # 震度ごとにまとめてプロット（描画負荷軽減のため）
             for code in INTENSITY_DISPLAY_NAMES.keys():
-                subset = active_regions[active_regions['intensity'] == code]
-                if subset.empty: continue
-
-                color = INTENSITY_COLORS.get(code, "#ffffff")
-                label = INTENSITY_LABELS.get(code, code)
-                text_color = '#000000' if code in ["1","2","4","5-","5+"] else '#ffffff'
-
-                ax.scatter(subset['rep_x'], subset['rep_y'], marker='s', s=144, color=color,
-                        edgecolors='#000000', linewidths=0.5, zorder=8)
-
-                for _, row in subset.iterrows():
-                    ax.text(row['rep_x'], row['rep_y'], label, color=text_color,
-                            fontsize=8, ha='center', va='center', fontweight='bold', zorder=9)
-
-            # 震度アイコン (観測点)
-            for code in INTENSITY_DISPLAY_NAMES.keys():
+                # その震度の観測点を抽出
                 pts = [st for st in station_data if st['intensity'] == code]
                 if not pts: continue
 
@@ -277,15 +271,19 @@ class MapRenderer:
 
                 lons = [p['lon'] for p in pts]
                 lats = [p['lat'] for p in pts]
-                ax.scatter(lons, lats, marker='o', s=100, color=color, edgecolors='#ffffff', linewidths=0.8, zorder=10)
+
+                # 観測点アイコン
+                ax.scatter(lons, lats, marker='s', s=144, color=color, edgecolors='#000000', linewidths=0.5, zorder=10)
+
+                # 震度テキスト
                 for p in pts:
-                    ax.text(p['lon'], p['lat'], label, color=text_color, fontsize=7,
+                    ax.text(p['lon'], p['lat'], label, color=text_color, fontsize=8,
                             ha='center', va='center', fontweight='bold', zorder=11)
 
             # 震源地
             if lat and lon:
-                ax.scatter(lon, lat, marker='x', color='#ffffff', s=80, linewidths=2.5, zorder=20)
-                ax.scatter(lon, lat, marker='x', color='#ff3b30', s=70, linewidths=1.5, zorder=21)
+                ax.scatter(lon, lat, marker='x', color='#ffffff', s=100, linewidths=3.0, zorder=20)
+                ax.scatter(lon, lat, marker='x', color='#ff3b30', s=80, linewidths=2.0, zorder=21)
 
             # レイアウト調整
             ax.set_position([0, 0, 1 - sidebar_ratio, 1.0])
@@ -298,7 +296,6 @@ class MapRenderer:
                                         transform=fig.transFigure, color='#000000', alpha=0.9, zorder=10)
             fig.patches.append(panel_rect)
 
-            # テキスト情報
             fig.text(0.02, 0.95, "各地の震度情報", color='#ffffff', fontsize=24, fontweight='bold', va='top', zorder=100)
             fig.text(0.02, 0.915, "Seismic Intensity Report", color='#ffffff', fontsize=12, va='top', zorder=100)
             fig.text(0.02, 0.89, announce_time, color='#ffffff', fontsize=14, va='top', zorder=100)
@@ -378,8 +375,8 @@ class MapRenderer:
             if fig:
                 fig.clf()
                 plt.close(fig)
-            plt.close('all') # 念のため全てのplotを閉じる
-            gc.collect()     # ガベージコレクションを促進
+            plt.close('all')
+            gc.collect()
 
 
 class EarthquakeMonitor:
@@ -389,10 +386,7 @@ class EarthquakeMonitor:
         self.last_event_time = state.get('event_time') or state.get('updated')
         self.slack_client = WebClient(token=SLACK_BOT_TOKEN)
         self.session = requests.Session()
-
-        # 描画クラスを初期化
         self.renderer = MapRenderer()
-
         print(f"Loaded state from S3: ID={self.last_event_id}, Time={self.last_event_time}")
 
     def _load_state(self):
@@ -515,7 +509,7 @@ class EarthquakeMonitor:
                 epicenter_name = '不明'
                 coord_str = ''
 
-            # 津波情報取得 (jmx_ib優先)
+            # 津波情報取得
             tsunami_text = x_text(body, './/jmx_ib:Comments/jmx_ib:ForecastComment/jmx_ib:Text')
             if not tsunami_text:
                 tsunami_text = x_text(body, './/jmx:Comments/jmx:ForecastComment/jmx:Text')
@@ -550,18 +544,31 @@ class EarthquakeMonitor:
 
                             for st in city.xpath('jmx_ib:IntensityStation', namespaces=JMA_NS):
                                 st_name = x_text(st, 'jmx_ib:Name')
+                                st_code = x_text(st, 'jmx_ib:Code') # 観測点コードを取得
                                 st_int = x_text(st, 'jmx_ib:Int')
-                                st_coord = x_text(st, 'jmx_eb:Coordinate')
 
-                                if st_coord:
-                                    s_match = _COORD_PATTERN_2.search(st_coord)
-                                    if s_match:
-                                        station_data.append({
-                                            'name': st_name,
-                                            'intensity': st_int,
-                                            'lat': float(s_match.group(1)),
-                                            'lon': float(s_match.group(2))
-                                        })
+                                # XMLの座標ではなく、stations.parquet (STATIONS_DB) の座標を優先使用
+                                lat, lon = None, None
+                                if st_code in STATIONS_DB:
+                                    lat = STATIONS_DB[st_code]['lat']
+                                    lon = STATIONS_DB[st_code]['lon']
+                                else:
+                                    # DBにない場合はXMLのCoordinateを使用（フォールバック）
+                                    st_coord = x_text(st, 'jmx_eb:Coordinate')
+                                    if st_coord:
+                                        s_match = _COORD_PATTERN_2.search(st_coord)
+                                        if s_match:
+                                            lat = float(s_match.group(1))
+                                            lon = float(s_match.group(2))
+
+                                if lat is not None and lon is not None:
+                                    station_data.append({
+                                        'name': st_name,
+                                        'code': st_code,
+                                        'intensity': st_int,
+                                        'lat': lat,
+                                        'lon': lon
+                                    })
 
             lat, lon, depth = None, None, "不明"
             if coord_str:
@@ -648,22 +655,15 @@ class EarthquakeMonitor:
             return
 
         try:
-            # 絵文字の判定
             emoji = ""
-            # 震度を数値スコアに変換して比較しやすくする
             intensity_order = {
                 "0": 0, "1": 10, "2": 20, "3": 30, "4": 40,
                 "5-": 50, "5+": 55, "6-": 60, "6+": 65, "7": 70
             }
             score = intensity_order.get(str(max_int_raw), 0)
 
-            # 条件1: 赤色相当 (:rotating_light:)
-            # 津波警報(大津波警報含む) または 震度5弱(50)以上
             if "警報" in tsunami_text or score >= 50:
                 emoji = " :rotating_light:"
-
-            # 条件2: 黄色相当 (:warning:)
-            # 津波注意報 または 津波情報が不明 または 震度4(40)以上
             elif "注意報" in tsunami_text or "不明" in tsunami_text or score >= 40:
                 emoji = " :warning:"
 
@@ -726,7 +726,6 @@ def lambda_handler(event, context):
         print("No new entries to process.")
         return {"statusCode": 200, "body": "No new entries"}
 
-    # 発生時刻が古い順にソート（通知順序の保証）
     new_entries_to_process.sort(key=lambda x: x.get('updated', ''))
 
     print(f"Found {len(new_entries_to_process)} new entries. Starting parallel processing...")
