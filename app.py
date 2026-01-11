@@ -188,6 +188,14 @@ class MapRenderer:
                 active_points.append((s['lon'], s['lat']))
 
         fig = None
+        import numpy as np
+        fig_h = 10.8
+        total_w = 19.2  # 16:9
+        sidebar_w = 4.8
+        sidebar_ratio = sidebar_w / total_w
+        map_w_fig = total_w - sidebar_w
+        target_map_aspect = map_w_fig / fig_h
+
         try:
             if active_points:
                 lons_all, lats_all = zip(*active_points)
@@ -196,38 +204,37 @@ class MapRenderer:
 
                 d_lat = max_lat - min_lat
                 d_lon = max_lon - min_lon
-
-                import numpy as np
                 cos_lat = np.cos(np.radians((max_lat + min_lat) / 2))
 
-                # マージン設定
-                span_lat = max(d_lat * 1.4, 2.5)
-                span_lon = max(d_lon * 1.4, 2.5 / cos_lat)
+                # マージン設定 (少し広めに設定して周辺状況を把握しやすくする)
+                span_lat = max(d_lat * 1.5, 3.5)
+                span_lon = max(d_lon * 1.5, 3.5 / cos_lat)
+
+                # 描画領域のアスペクト比に合わせてスパンを調整
+                current_aspect = (span_lon * cos_lat) / span_lat
+                if current_aspect < target_map_aspect:
+                    # 横に広げてアスペクト比を合わせる
+                    span_lon = (target_map_aspect * span_lat) / cos_lat
+                else:
+                    # 縦に広げてアスペクト比を合わせる
+                    span_lat = (span_lon * cos_lat) / target_map_aspect
 
                 center_lat = (max_lat + min_lat) / 2
                 center_lon = (max_lon + min_lon) / 2
 
                 lim_w, lim_e = center_lon - span_lon/2, center_lon + span_lon/2
                 lim_s, lim_n = center_lat - span_lat/2, center_lat + span_lat/2
-
-                map_aspect = (span_lon * cos_lat) / span_lat
-
-                fig_h = 10.8
-                map_w = fig_h * map_aspect
-                sidebar_w = 4.8
-                total_w = map_w + sidebar_w
-
-                fig, ax = plt.subplots(figsize=(total_w, fig_h))
-                sidebar_ratio = sidebar_w / total_w
-
                 relevant_gdf = gdf.cx[lim_w:lim_e, lim_s:lim_n].copy()
             else:
-                # デフォルト表示
-                lim_w, lim_e = 128, 146
-                lim_s, lim_n = 30, 46
-                sidebar_ratio = 0.25
-                fig, ax = plt.subplots(figsize=(19.2, 10.8))
-                relevant_gdf = gdf.copy()
+                # デフォルト表示 (日本全体が収まるように16:9で調整)
+                center_lat, center_lon = 38.0, 137.5
+                span_lat = 18.0
+                span_lon = (target_map_aspect * span_lat) / np.cos(np.radians(center_lat))
+                lim_w, lim_e = center_lon - span_lon/2, center_lon + span_lon/2
+                lim_s, lim_n = center_lat - span_lat/2, center_lat + span_lat/2
+                relevant_gdf = gdf.cx[lim_w:lim_e, lim_s:lim_n].copy()
+
+            fig, ax = plt.subplots(figsize=(total_w, fig_h))
 
             # 震度データのマッピング（市区町村ごとの最大震度で塗る）
             lookup = {str(k): v for k, v in regional_intensities.items()}
