@@ -343,10 +343,21 @@ class MapRenderer:
 
             if is_eew:
                 eew_msg = "この地震について、緊急地震速報を発表しています。"
-                ax.add_patch(mpatches.Rectangle((0.01, 0.05), 0.48, 0.06, transform=ax.transAxes,
-                                            color='#000000', alpha=0.7, zorder=35))
-                ax.text(0.02, 0.08, eew_msg, transform=ax.transAxes, color='#ffff00',
-                        fontsize=18, fontweight='bold', va='center', zorder=40)
+                # 座標系を明示的に指定してFigureレベルで描画することで、サイドバー等の背面に入り込むのを防ぎます
+                map_width_ratio = 1 - sidebar_ratio
+                rect_x = 0.01 * map_width_ratio
+                rect_y = 0.05
+                rect_w = 0.48 * map_width_ratio
+                rect_h = 0.06
+
+                # 背景の矩形を fig.patches に追加 (zorderを高く設定)
+                eew_rect = mpatches.Rectangle((rect_x, rect_y), rect_w, rect_h, transform=fig.transFigure,
+                                            color='#000000', alpha=0.7, zorder=2000)
+                fig.patches.append(eew_rect)
+
+                # テキストを fig.text で描画 (さらに高い zorder を指定して最前面へ)
+                fig.text(0.02 * map_width_ratio, 0.08, eew_msg, color='#ffff00',
+                        fontsize=18, fontweight='bold', va='center', zorder=2001)
 
             # インセットマップ
             if self.gdf_nation is not None:
